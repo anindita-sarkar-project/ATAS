@@ -75,7 +75,6 @@
  *         by this milestone; a relay through a non-root intermediate (3+ hops from
  *         root) is not yet correctly received until the EB IE milestone lands.
  *
- * \author Alakesh Kalita
  */
 
 #include "contiki.h"

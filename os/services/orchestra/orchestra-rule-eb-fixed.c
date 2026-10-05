@@ -68,7 +68,6 @@
  * sender/receiver addresses) exactly as before -- only the EB control-plane
  * slot moves to a fixed, network-wide-common position.
  *
- * \author Alakesh Kalita
  */
 
 #include "contiki.h"
