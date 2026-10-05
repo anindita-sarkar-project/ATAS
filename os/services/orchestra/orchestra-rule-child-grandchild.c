@@ -69,9 +69,10 @@
  *         The own-shard-count signal reuses the same children-list Enhanced
  *         Beacon Information Element orchestra-rule-implicit-ack.c already
  *         defines (see MLME_SHORT_IE_TSCH_IA_CHILDREN, frame802154e-ie.c),
- *         piggybacking one byte per direct child -- that byte used to carry
- *         a 0/1 has-descendants flag there, and here instead carries this
- *         node's own current shard count. No framer, tsch.c, or tsch.h
+ *         as a single entry (this node's address + one byte) in every EB,
+ *         leaves included -- that byte used to carry a 0/1 has-descendants
+ *         flag there, and here instead carries this node's own current
+ *         shard count (see cg_get_own_children()). No framer, tsch.c, or tsch.h
  *         change was needed to support this reuse -- see this file's own
  *         TSCH_CALLBACK_IA_OWN_CHILDREN/TSCH_CALLBACK_IA_CHILD_EB
  *         definitions below.
@@ -107,8 +108,12 @@
 #include "contiki.h"
 #include "orchestra.h"
 #include "net/packetbuf.h"
+#include "net/mac/framer/frame802154.h"
 #include "net/mac/tsch/tsch-roots.h"
 #include "net/routing/rpl-classic/rpl.h"
+#include "net/nbr-table.h"
+#include "lib/list.h"
+#include "lib/memb.h"
 #include "sys/ctimer.h"
 #include "sys/log.h"
 
@@ -116,6 +121,91 @@
 #define LOG_LEVEL  LOG_LEVEL_MAC
 
 #if UIP_MAX_ROUTES != 0
+
+/* Structural provisioning (default 1, ON): whether cg_own_shard_count()
+ * counts this node's own direct RPL children at all. This is APAS's central
+ * claim -- a relay's uplink capacity toward its own parent grows the instant
+ * a child attaches (child_added(), zero traffic observed) rather than only
+ * after that child's traffic has been observed and estimated. Setting this
+ * to 0 is an ABLATION BUILD, not a real deployment option: with it off, the
+ * child-count loop below is skipped entirely, and this node's shard count
+ * comes only from CG_LOAD_BONUS (traffic actually observed) exactly as a
+ * purely reactive scheme like A3 would size it -- everything else in this
+ * file (idle reclaim, rank cap, hold-before-use) is untouched, so this
+ * isolates the one variable the structural-provisioning claim depends on
+ * for a controlled comparison (full APAS vs. APAS-without-structural). */
+#ifndef CG_CONF_STRUCTURAL_PROVISIONING
+#define CG_STRUCTURAL_PROVISIONING 1
+#else
+#define CG_STRUCTURAL_PROVISIONING CG_CONF_STRUCTURAL_PROVISIONING
+#endif
+
+/* Dynamic K (default 0, off): no K_max at all. A node's shard count is
+ * exactly K_S = (own direct child count k) + 1 (its own traffic) + load
+ * bonus, however large k is -- a node with 7 real children gets 8 shards
+ * toward its parent, a node with 2 gets 3, and the BR installs, for each of
+ * its own children, exactly the k+1 Rx cells that child advertises. There
+ * is no policy cap (the fixed 4, the rank-tiered 6/4) and no compile-time
+ * per-relationship array bound: cells are kept in per-relationship lists
+ * drawn from one shared pool (cg_cell_memb, sized to TSCH's own link pool),
+ * and the children table is sized to the neighbor table, since a node can
+ * never have more direct children than neighbors. The only remaining
+ * bounds are physical ones no policy can lift: a relationship cannot use
+ * more cells than its slotframe has timeslots, the whole node cannot hold
+ * more cells than TSCH_SCHEDULE_MAX_LINKS, and K_S rides a one-byte EB
+ * field (255). CG_RANK_CAP is ignored when this is on, since there is no
+ * cap left for a rank tier to lift a node above.
+ *
+ * k deliberately counts DIRECT children only. Counting a relay's whole
+ * subtree (one cell per descendant, via a descendant count in the EB) was
+ * tried and dropped: stale children after parent switches made the counts
+ * count-to-infinity (60 nodes: 31.9% PDR), and even correct counts would
+ * need the BR to hold one cell per node in the network, more than a
+ * slotframe has timeslots once N exceeds its length. */
+#ifndef CG_CONF_DYNAMIC_KMAX
+#define CG_DYNAMIC_KMAX 0
+#else
+#define CG_DYNAMIC_KMAX CG_CONF_DYNAMIC_KMAX
+#endif
+
+#if CG_DYNAMIC_KMAX
+/* Not a policy cap: the largest value the one-byte EB shard-count field
+ * can carry. */
+#define CG_RELAY_SHARDS_MAX 255
+#endif /* CG_DYNAMIC_KMAX */
+
+/* Length of the BR-facing slotframe (sf_root), in which the BR installs
+ * k_c + 1 Rx cells for each of its children c. The fixed-cap builds use
+ * ORCHESTRA_IA_ROOT_PERIOD (7): with at most 4-6 cells per child that fit,
+ * but it silently limits the BR to 7 distinct cells in total however many
+ * children it has -- beyond that, children's cells pile onto the same
+ * timeslots and the BR can only listen on one of them. Under
+ * CG_DYNAMIC_KMAX the BR therefore uses the same, full-length slotframe as
+ * every other parent (TSCH_IA_SFS_SIZE), so the BR is sized like any relay:
+ * sum over its children of (k_c + 1) cells. */
+#ifdef CG_CONF_ROOT_PERIOD
+#define CG_ROOT_PERIOD CG_CONF_ROOT_PERIOD
+#elif CG_DYNAMIC_KMAX
+#define CG_ROOT_PERIOD TSCH_IA_SFS_SIZE
+#else
+#define CG_ROOT_PERIOD ORCHESTRA_IA_ROOT_PERIOD
+#endif
+
+/* Distinct shard timeslots (default: on under CG_DYNAMIC_KMAX). The fixed-
+ * cap builds place shard k at h + k*0x85EBCA6B (mod 2^32, mod period). At
+ * period 67 that constant acts as a stride and a link's shards stay distinct
+ * in practice (0 of 20000 simulated links up to K = 20), but nothing
+ * guarantees it: in the old 7-slot root frame every link with K >= 4 had two
+ * shards on one timeslot, where the parent can only listen on one. Under
+ * CG_DYNAMIC_KMAX shard k is placed at base + k*stride (mod period) instead,
+ * which gives every one of a relationship's first `period` shards its own
+ * timeslot for any period (see cg_shard_slot()). Off in the fixed-cap
+ * builds so their schedule is unchanged. */
+#ifdef CG_CONF_DISTINCT_SHARD_SLOTS
+#define CG_DISTINCT_SHARD_SLOTS CG_CONF_DISTINCT_SHARD_SLOTS
+#else
+#define CG_DISTINCT_SHARD_SLOTS CG_DYNAMIC_KMAX
+#endif
 
 /* Rank-aware cap (default 0, off): every node's cap has been a single flat
  * constant so far, which the companion paper's own 300-node extended-scale
@@ -151,11 +241,9 @@
 #define CG_RANK_CAP_THRESHOLD CG_CONF_RANK_CAP_THRESHOLD
 #endif
 
-/* The boosted cap for nodes at or below CG_RANK_CAP_THRESHOLD. Becomes the
- * array size below (CG_RELAY_SHARDS_MAX) since every per-child cell array
- * must be sized for the largest cap ANY node in the network might use --
- * far-from-root nodes still only ever request up to CG_RELAY_SHARDS_FAR
- * (see cg_effective_cap()), the array is just sized to allow more. */
+/* The boosted cap for nodes at or below CG_RANK_CAP_THRESHOLD; far-from-
+ * root nodes only ever request up to CG_RELAY_SHARDS_FAR (see
+ * cg_effective_cap()). */
 #ifndef CG_CONF_RELAY_SHARDS_NEAR_ROOT
 #define CG_RELAY_SHARDS_NEAR_ROOT 6
 #else
@@ -170,20 +258,61 @@
 #define CG_RELAY_SHARDS_FAR CG_CONF_RELAY_SHARDS_FAR
 #endif
 
+#if !CG_DYNAMIC_KMAX
 #define CG_RELAY_SHARDS_MAX CG_RELAY_SHARDS_NEAR_ROOT
+#endif
 #else /* CG_RANK_CAP */
-/* Largest number of simultaneously active shards this build supports for a
- * single parent-child relationship -- a fixed cap (not a VLA) so every
- * struct here has a size independent of CG_MAX_CHILDREN. Also caps a node's
- * own uplink shard count (own_child_count + 1), so a node with more direct
- * children than this still only ever uses this many uplink shards. */
+/* Flat policy cap on a node's own shard count (own_child_count + 1), so a
+ * node with more direct children than this still only ever uses this many
+ * uplink shards. Not used under CG_DYNAMIC_KMAX, which has no cap. */
+#if !CG_DYNAMIC_KMAX
 #define CG_RELAY_SHARDS_MAX 4
+#endif
 #endif /* CG_RANK_CAP */
 
+/* ABLATION-ONLY switches (default 0): each reinstates one rejected design so
+ * the paper's ablation runs exercise real code. Never enable in a deployment.
+ *
+ * CG_CONF_ABLATION_SUBTREE_COUNT: k counts every descendant instead of the
+ * direct children; each node advertises its descendant count d as a second
+ * EB entry and a parent sums (1 + d_c) over its children. Known to diverge
+ * (stale children after parent switches are counted twice).
+ *
+ * CG_CONF_ABLATION_ANY_FRAME_ACTIVITY: idle reclaim treats any received
+ * frame as activity (the original test, packetbuf_datalen() on the raw
+ * frame, which is never 0), so keepalives and RPL control keep every child
+ * active. */
+#ifndef CG_CONF_ABLATION_SUBTREE_COUNT
+#define CG_ABLATION_SUBTREE_COUNT 0
+#else
+#define CG_ABLATION_SUBTREE_COUNT CG_CONF_ABLATION_SUBTREE_COUNT
+#endif
+#ifndef CG_CONF_ABLATION_ANY_FRAME_ACTIVITY
+#define CG_ABLATION_ANY_FRAME_ACTIVITY 0
+#else
+#define CG_ABLATION_ANY_FRAME_ACTIVITY CG_CONF_ABLATION_ANY_FRAME_ACTIVITY
+#endif
+
 #ifndef CG_CONF_MAX_CHILDREN
+#if CG_DYNAMIC_KMAX
+/* A node's direct RPL children are all its neighbors, so the neighbor table
+ * is the real bound -- no separate, smaller child limit. */
+#define CG_MAX_CHILDREN NBR_TABLE_MAX_NEIGHBORS
+#else
 #define CG_MAX_CHILDREN 6
+#endif
 #else
 #define CG_MAX_CHILDREN CG_CONF_MAX_CHILDREN
+#endif
+
+/* Every cell this rule installs (own uplink/root-adjacent, every child's
+ * relay_rx/root_adjacent_rx) is tracked through one entry of this shared
+ * pool. Defaults to TSCH's own link pool size: TSCH cannot hold more links
+ * than that anyway, so this adds no bound of its own. */
+#ifndef CG_CONF_CELL_POOL_SIZE
+#define CG_CELL_POOL_SIZE TSCH_SCHEDULE_MAX_LINKS
+#else
+#define CG_CELL_POOL_SIZE CG_CONF_CELL_POOL_SIZE
 #endif
 
 /* Comparison variant, off by default: instead of adopting a child's
@@ -215,15 +344,13 @@
  *
  * Deliberately does NOT touch the child's own uplink behavior: the child
  * still transmits on however many shards ITS OWN child count says it needs,
- * unaware the parent shrank its Rx side. If the child is genuinely still
- * alive and later sends again, the mismatch is caught -- and corrected --
- * the same way every other shard-count change already is here: the next
- * time the parent hears that child's EB and finds its reported count no
- * longer matches c->shard_count, cg_child_eb_input() restores it directly.
- * Some frames sent on a just-reclaimed shard in that window are lost, the
- * same bounded, one-EB-period class of loss this design already accepts
- * whenever a shard count needs to grow (see update_child_relay_rx()'s own
- * comment on the bootstrap default). CG_IDLE_CHECK_PERIOD and the EWMA
+ * unaware the parent shrank its Rx side. A reclaimed child is then held at
+ * 1 shard even though its EBs keep advertising more (it still beacons while
+ * idle -- adopting those EBs would undo the reclaim within one EB period);
+ * the moment it sends real data again, cg_data_input() restores the count
+ * its EBs advertise. Its shard 0 is always kept, so that first data frame
+ * does get through; frames it sent on its other shards before the restore
+ * are retried on its next cell. CG_IDLE_CHECK_PERIOD and the EWMA
  * decay shift below are chosen so this only fires after several minutes of
  * true silence, not a single missed application-layer send. */
 #ifndef CG_CONF_IDLE_RECLAIM
@@ -289,7 +416,42 @@
 #endif
 
 #if CG_LOAD_BONUS
-/* How often we fold "how much did I send this window" into the load EWMA. */
+/* How X_S is decided. Queue-based (default under CG_DYNAMIC_KMAX): no
+ * traffic-rate threshold at all. Once per slotframe -- the time in which
+ * every one of this node's installed uplink cells comes round exactly once,
+ * so at most that many packets can leave per sample -- we compare the
+ * number of packets queued to our parent with that cell count. If more
+ * packets are waiting than one round of our cells can carry, at two
+ * samples in a row, the backlog is not draining: our cells are not
+ * enough, at whatever rate traffic happens to arrive, so X_S = 1 is
+ * granted immediately. A single packet that is merely retrying after a
+ * collision or a lost ACK never counts -- that is a loss, not a lack of
+ * cells, and an extra cell would not fix it. X_S is released
+ * only after CG_LOAD_RELEASE_WINDOWS consecutive CG_LOAD_CHECK_PERIOD
+ * windows without any such shortage (rise fast, fall slow). Rate-based
+ * (the fixed-cap builds, unchanged): an EWMA of packets per window
+ * compared against the fixed CG_LOAD_BUSY_THRESHOLD, which is only
+ * meaningful for the one send rate it was tuned for. */
+#ifdef CG_CONF_LOAD_QUEUE_BASED
+#define CG_LOAD_QUEUE_BASED CG_CONF_LOAD_QUEUE_BASED
+#else
+#define CG_LOAD_QUEUE_BASED CG_DYNAMIC_KMAX
+#endif
+
+#if CG_LOAD_QUEUE_BASED
+/* Quiet windows (of CG_LOAD_CHECK_PERIOD each) before X_S is released:
+ * 5 x 60 s. A hysteresis time, not a traffic threshold -- it keeps a node
+ * that needs its extra cell under steady load from dropping it the moment
+ * that cell has cleared its queue. */
+#ifndef CG_CONF_LOAD_RELEASE_WINDOWS
+#define CG_LOAD_RELEASE_WINDOWS 5
+#else
+#define CG_LOAD_RELEASE_WINDOWS CG_CONF_LOAD_RELEASE_WINDOWS
+#endif
+#endif /* CG_LOAD_QUEUE_BASED */
+
+/* Queue-based: the release window. Rate-based: how often we fold "how much
+ * did I send this window" into the load EWMA. */
 #ifndef CG_CONF_LOAD_CHECK_PERIOD
 #define CG_LOAD_CHECK_PERIOD (CLOCK_SECOND * 60)
 #else
@@ -410,6 +572,9 @@ struct cg_child {
   linkaddr_t addr;
   uint8_t in_use;
   uint8_t shard_count;
+#if CG_ABLATION_SUBTREE_COUNT
+  uint8_t descendants; /* as last advertised by this child (ablation) */
+#endif
 #if CG_EWMA_SHARD_COUNT
   /* Q8 fixed-point running average of every shard count c has reported in
    * its EB, updated in cg_child_eb_input(); shard_count above tracks its
@@ -424,19 +589,34 @@ struct cg_child {
   /* Q8 fixed-point recent-activity estimate, 256 = just heard from it,
    * decaying toward 0 under sustained silence (see idle_tick()). */
   uint16_t idle_ewma_q8;
+  /* Set when idle_tick() reclaimed this child: its cells stay at 1, even
+   * though its EBs keep advertising more, until it sends real data again
+   * (cg_data_input()). advertised holds what its EBs say meanwhile. */
+  uint8_t reclaimed;
+  uint8_t advertised;
 #endif
-  struct tsch_link *relay_rx[CG_RELAY_SHARDS_MAX];
+  /* Lists of struct cg_cell, shard k at list position k (see
+   * cg_set_cells()). */
+  LIST_STRUCT(relay_rx);
   /* Only ever used when this node is the DAG root and this child is one of
    * its root-adjacent neighbors -- see update_child_root_adjacent_rx(). */
-  struct tsch_link *root_adjacent_rx[CG_RELAY_SHARDS_MAX];
+  LIST_STRUCT(root_adjacent_rx);
 };
+
+/* One installed cell; lists of these replace fixed per-relationship link
+ * arrays, so a relationship's shard count has no compile-time bound. */
+struct cg_cell {
+  struct cg_cell *next;
+  struct tsch_link *link;
+};
+MEMB(cg_cell_memb, struct cg_cell, CG_CELL_POOL_SIZE);
 
 static uint16_t slotframe_handle;
 static struct tsch_slotframe *sf_short; /* uplink + relay_rx, every child */
 static struct tsch_slotframe *sf_root;  /* root-adjacent cell(s) */
 
-static struct tsch_link *l_uplink[CG_RELAY_SHARDS_MAX];
-static struct tsch_link *l_root_adjacent[CG_RELAY_SHARDS_MAX];
+LIST(l_uplink);
+LIST(l_root_adjacent);
 
 static struct cg_child children[CG_MAX_CHILDREN];
 
@@ -447,9 +627,19 @@ static struct cg_child children[CG_MAX_CHILDREN];
  * to one of our own cells; folded into own_load_ewma_q8 and, if that
  * estimate is sustained above CG_LOAD_BUSY_THRESHOLD, own_load_bonus is set
  * to 1 and cg_own_shard_count() adds it on top of the structural count. */
+static uint8_t own_load_bonus;
+#if CG_LOAD_QUEUE_BASED
+/* Whether the previous per-slotframe sample already found more packets
+ * queued to our parent than we have uplink cells. */
+static uint8_t last_backlogged;
+/* Set by queue_tick() when a head packet survived a full slotframe;
+ * cleared every CG_LOAD_CHECK_PERIOD by load_tick(). */
+static uint8_t shortage_seen;
+static uint8_t quiet_windows;
+#else
 static uint16_t own_load_tx_count;
 static uint16_t own_load_ewma_q8;
-static uint8_t own_load_bonus;
+#endif
 #endif
 
 #if CG_HOLD_BEFORE_USE
@@ -467,13 +657,50 @@ cg_slot(uint32_t hash, uint16_t period)
   return period > 0 ? (uint16_t)(hash % period) : 0;
 }
 /*---------------------------------------------------------------------------*/
+#if CG_DISTINCT_SHARD_SLOTS
+static uint16_t
+cg_gcd(uint16_t a, uint16_t b)
+{
+  while(b != 0) {
+    uint16_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+#endif /* CG_DISTINCT_SHARD_SLOTS */
+/*---------------------------------------------------------------------------*/
+/* Timeslot of shard k of the relationship hashed to h. Under
+ * CG_DISTINCT_SHARD_SLOTS: base + k*stride (mod period), with stride
+ * coprime to period, so shards 0..period-1 all get different timeslots --
+ * both endpoints compute the same sequence from h alone. Otherwise the
+ * fixed-cap builds' independent per-shard hash. */
+static uint16_t
+cg_shard_slot(uint32_t h, uint16_t k, uint16_t period)
+{
+#if CG_DISTINCT_SHARD_SLOTS
+  uint16_t base, stride;
+  if(period <= 1) {
+    return 0;
+  }
+  base = cg_slot(h, period);
+  stride = 1 + (uint16_t)((h / period) % (period - 1));
+  while(cg_gcd(stride, period) != 1) {
+    stride = stride % (period - 1) + 1; /* reaches 1 at worst, always coprime */
+  }
+  return (uint16_t)((base + (uint32_t)k * stride) % period);
+#else
+  return cg_slot(h + (uint32_t)k * 0x85EBCA6Bu, period);
+#endif
+}
+/*---------------------------------------------------------------------------*/
 static uint16_t
 cg_channel(uint32_t hash)
 {
   return tsch_hopping_sequence_length.val > 0 ? (uint16_t)(hash % tsch_hopping_sequence_length.val) : 0;
 }
 /*---------------------------------------------------------------------------*/
-#if CG_RANK_CAP
+#if CG_RANK_CAP && !CG_DYNAMIC_KMAX
 /* This node's own cap on shard count: CG_RELAY_SHARDS_NEAR_ROOT if our own
  * RPL rank is at or below CG_RANK_CAP_THRESHOLD, else the ordinary
  * CG_RELAY_SHARDS_FAR. Rank is already computed by RPL for routing; no
@@ -497,37 +724,150 @@ cg_effective_cap(void)
   }
   return cap;
 }
-#endif /* CG_RANK_CAP */
+#endif /* CG_RANK_CAP && !CG_DYNAMIC_KMAX */
 /*---------------------------------------------------------------------------*/
 /* This node's own shard count: (own direct RPL child count) + 1 for its own
  * traffic, capped at cg_effective_cap() (CG_RANK_CAP) or the flat
- * CG_RELAY_SHARDS_MAX otherwise. Entirely local -- Orchestra's own
+ * CG_RELAY_SHARDS_MAX otherwise -- or, under CG_DYNAMIC_KMAX, not capped at
+ * all (CG_RELAY_SHARDS_MAX is then just the one-byte EB field's range, 255,
+ * far beyond any real child count). Entirely local -- Orchestra's own
  * child_added()/child_removed() callbacks already maintain children[], no
  * routing-table access or any other signal needed. Sizes this node's own
  * uplink/root-adjacent cells to its parent (update_uplink()/update_root_
  * adjacent() below) and is what this node advertises in its own EB
- * (cg_get_own_children()) for its parent to size a matching Rx cell. */
+ * (cg_get_own_children()) for its parent to size a matching Rx cell.
+ *
+ * Under the CG_STRUCTURAL_PROVISIONING=0 ablation build, the child-count
+ * loop is skipped: n starts at 1 (own traffic only) regardless of how many
+ * children this node actually has, so a newly-attached child earns this
+ * relay no additional uplink capacity until CG_LOAD_BONUS's own traffic
+ * observation later grants it -- the reactive-only comparison point. */
+#if CG_ABLATION_SUBTREE_COUNT
+/* Ablation: nodes below this one, sum over direct children of (1 + d_c). */
+static uint8_t
+cg_own_descendants(void)
+{
+  int i;
+  uint16_t d = 0;
+  for(i = 0; i < CG_MAX_CHILDREN; i++) {
+    if(children[i].in_use) {
+      d += 1 + children[i].descendants;
+    }
+  }
+  return d > 254 ? 254 : (uint8_t)d;
+}
+#endif /* CG_ABLATION_SUBTREE_COUNT */
+/*---------------------------------------------------------------------------*/
 static uint8_t
 cg_own_shard_count(void)
 {
+#if CG_STRUCTURAL_PROVISIONING && !CG_ABLATION_SUBTREE_COUNT
   int i;
-  uint8_t n = 0;
+#endif
+  uint16_t n = 0;
   uint8_t cap;
+#if CG_STRUCTURAL_PROVISIONING
+#if CG_ABLATION_SUBTREE_COUNT
+  n = cg_own_descendants();
+#else
   for(i = 0; i < CG_MAX_CHILDREN; i++) {
     if(children[i].in_use) {
       n++;
     }
   }
+#endif
+#endif
   n++; /* +1 for this node's own traffic */
 #if CG_LOAD_BONUS
   n += own_load_bonus; /* +1 more if sustained real load earned it (load_tick()) */
 #endif
-#if CG_RANK_CAP
+#if CG_RANK_CAP && !CG_DYNAMIC_KMAX
   cap = cg_effective_cap();
 #else
   cap = CG_RELAY_SHARDS_MAX;
 #endif
-  return n > cap ? cap : n;
+  return n > cap ? cap : (uint8_t)n;
+}
+/*---------------------------------------------------------------------------*/
+/* Logs this node's own K_S whenever it changes. */
+static void
+cg_log_own_k(uint8_t k)
+{
+  static uint8_t last_k;
+  if(k != last_k) {
+#if CG_ABLATION_SUBTREE_COUNT
+    LOG_INFO("cg: own K=%u (descendants=%u)\n", k, cg_own_descendants());
+#else
+    LOG_INFO("cg: own K=%u\n", k);
+#endif
+    last_k = k;
+  }
+}
+/*---------------------------------------------------------------------------*/
+/* Removes every cell in list cells from slotframe sf. */
+static void
+cg_clear_cells(struct tsch_slotframe *sf, list_t cells)
+{
+  struct cg_cell *cell;
+  while((cell = list_pop(cells)) != NULL) {
+    if(sf != NULL) {
+      tsch_schedule_remove_link(sf, cell->link);
+    }
+    memb_free(&cg_cell_memb, cell);
+  }
+}
+/*---------------------------------------------------------------------------*/
+/* Makes list cells hold exactly want_shards cells in slotframe sf, shard k
+ * at cg_shard_slot(h, k) (k = 0..want_shards-1): existing shards are retargeted
+ * in place, missing ones added, surplus ones removed from the tail. Nothing
+ * here bounds want_shards except physical limits: a relationship cannot use
+ * more cells than the slotframe has timeslots, and an add fails only when
+ * TSCH's own link pool (or cg_cell_memb, sized to match) is exhausted. */
+static void
+cg_set_cells(struct tsch_slotframe *sf, list_t cells, uint16_t want_shards,
+             uint8_t link_options, const linkaddr_t *addr, uint32_t h, uint16_t period)
+{
+  struct cg_cell *cell;
+  uint16_t k = 0;
+
+  if(want_shards > period) {
+    LOG_WARN("cg: %u shards wanted but slotframe has only %u slots, using %u\n",
+             want_shards, period, period);
+    want_shards = period;
+  }
+  while(list_length(cells) > want_shards) {
+    cell = list_chop(cells);
+    tsch_schedule_remove_link(sf, cell->link);
+    memb_free(&cg_cell_memb, cell);
+  }
+  for(cell = list_head(cells); cell != NULL; cell = list_item_next(cell), k++) {
+    uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
+    /* Retarget in place rather than remove+re-add: for the uplink our own
+     * parent may have changed since this link was created (reconcile_parent_
+     * address() no longer tears these down on a parent switch -- see its
+     * own comment), and h already folds the *current* parent in, so only
+     * the destination address field needs an explicit copy to match. */
+    linkaddr_copy(&cell->link->addr, addr);
+    cell->link->timeslot = cg_shard_slot(h, k, period);
+    cell->link->channel_offset = cg_channel(kh);
+  }
+  for(; k < want_shards; k++) {
+    uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
+    cell = memb_alloc(&cg_cell_memb);
+    if(cell == NULL) {
+      LOG_ERR("cg: cell pool exhausted at shard %u of %u\n", k, want_shards);
+      return;
+    }
+    cell->link = tsch_schedule_add_link(sf, link_options, LINK_TYPE_NORMAL, addr,
+                                        cg_shard_slot(h, k, period), cg_channel(kh), 1);
+    if(cell->link == NULL) {
+      LOG_ERR("cg: TSCH link pool exhausted at shard %u of %u "
+              "(raise TSCH_SCHEDULE_CONF_MAX_LINKS)\n", k, want_shards);
+      memb_free(&cg_cell_memb, cell);
+      return;
+    }
+    list_add(cells, cell);
+  }
 }
 /*---------------------------------------------------------------------------*/
 static struct cg_child *
@@ -548,12 +888,15 @@ find_child(const linkaddr_t *addr)
 static struct cg_child *
 alloc_child(const linkaddr_t *addr)
 {
-  int i, j;
+  int i;
   for(i = 0; i < CG_MAX_CHILDREN; i++) {
     if(!children[i].in_use) {
       children[i].in_use = 1;
       linkaddr_copy(&children[i].addr, addr);
       children[i].shard_count = 0;
+#if CG_ABLATION_SUBTREE_COUNT
+      children[i].descendants = 0;
+#endif
 #if CG_EWMA_SHARD_COUNT
       children[i].shard_ewma_q8 = 1 << 8; /* matches the shard_count=1 bootstrap default below */
 #endif
@@ -564,11 +907,11 @@ alloc_child(const linkaddr_t *addr)
        * chance to send anything. */
       children[i].heard_since_check = 1;
       children[i].idle_ewma_q8 = 1 << 8;
+      children[i].reclaimed = 0;
+      children[i].advertised = 0;
 #endif
-      for(j = 0; j < CG_RELAY_SHARDS_MAX; j++) {
-        children[i].relay_rx[j] = NULL;
-        children[i].root_adjacent_rx[j] = NULL;
-      }
+      LIST_STRUCT_INIT(&children[i], relay_rx);
+      LIST_STRUCT_INIT(&children[i], root_adjacent_rx);
       return &children[i];
     }
   }
@@ -588,21 +931,16 @@ static void
 update_uplink(void)
 {
   uint8_t want_shards;
-  int k;
 #if CG_HOLD_BEFORE_USE
   static uint8_t last_held;
 #endif
   if(sf_short == NULL || linkaddr_cmp(&orchestra_parent_linkaddr, &linkaddr_null)
      || tsch_roots_is_root(&orchestra_parent_linkaddr) || !orchestra_parent_knows_us) {
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(l_uplink[k] != NULL) {
-        tsch_schedule_remove_link(sf_short, l_uplink[k]);
-        l_uplink[k] = NULL;
-      }
-    }
+    cg_clear_cells(sf_short, l_uplink);
     return;
   }
   want_shards = cg_own_shard_count();
+  cg_log_own_k(want_shards);
 #if CG_HOLD_BEFORE_USE
   if(want_shards > announced_shards) {
     if(want_shards != last_held) {
@@ -613,38 +951,10 @@ update_uplink(void)
     want_shards = announced_shards; /* increase not yet stated in an EB -- hold */
   }
 #endif
-  {
-    uint32_t h = ORCHESTRA_LINKADDR_HASH2(&orchestra_parent_linkaddr, &linkaddr_node_addr);
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(k >= want_shards) {
-        if(l_uplink[k] != NULL) {
-          tsch_schedule_remove_link(sf_short, l_uplink[k]);
-          l_uplink[k] = NULL;
-        }
-        continue;
-      }
-      {
-        uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
-        uint16_t ts = cg_slot(kh, TSCH_IA_SFS_SIZE);
-        uint16_t ch = cg_channel(kh);
-        if(l_uplink[k] == NULL) {
-          l_uplink[k] = tsch_schedule_add_link(sf_short, LINK_OPTION_TX | LINK_OPTION_SHARED,
-                                                LINK_TYPE_NORMAL, &orchestra_parent_linkaddr, ts, ch, 1);
-        } else {
-          /* Retarget in place rather than remove+re-add: our own parent may
-           * have changed since this link was created (reconcile_parent_
-           * address() no longer tears these down on a parent switch -- see
-           * its own comment), and HASH2 above already folds the *current*
-           * orchestra_parent_linkaddr in, so the position is already correct
-           * here too; only the destination address field needs an explicit
-           * copy to match. */
-          linkaddr_copy(&l_uplink[k]->addr, &orchestra_parent_linkaddr);
-          l_uplink[k]->timeslot = ts;
-          l_uplink[k]->channel_offset = ch;
-        }
-      }
-    }
-  }
+  cg_set_cells(sf_short, l_uplink, want_shards, LINK_OPTION_TX | LINK_OPTION_SHARED,
+               &orchestra_parent_linkaddr,
+               ORCHESTRA_LINKADDR_HASH2(&orchestra_parent_linkaddr, &linkaddr_node_addr),
+               TSCH_IA_SFS_SIZE);
 }
 /*---------------------------------------------------------------------------*/
 /* Our own root-adjacent cell(s), used instead of UPLINK when our parent is
@@ -653,21 +963,16 @@ static void
 update_root_adjacent(void)
 {
   uint8_t want_shards;
-  int k;
 #if CG_HOLD_BEFORE_USE
   static uint8_t last_held;
 #endif
   if(sf_root == NULL || linkaddr_cmp(&orchestra_parent_linkaddr, &linkaddr_null)
      || !tsch_roots_is_root(&orchestra_parent_linkaddr) || !orchestra_parent_knows_us) {
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(l_root_adjacent[k] != NULL) {
-        tsch_schedule_remove_link(sf_root, l_root_adjacent[k]);
-        l_root_adjacent[k] = NULL;
-      }
-    }
+    cg_clear_cells(sf_root, l_root_adjacent);
     return;
   }
   want_shards = cg_own_shard_count();
+  cg_log_own_k(want_shards);
 #if CG_HOLD_BEFORE_USE
   if(want_shards > announced_shards) {
     if(want_shards != last_held) {
@@ -678,31 +983,10 @@ update_root_adjacent(void)
     want_shards = announced_shards; /* increase not yet stated in an EB -- hold */
   }
 #endif
-  {
-    uint32_t h = ORCHESTRA_LINKADDR_HASH2(&orchestra_parent_linkaddr, &linkaddr_node_addr);
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(k >= want_shards) {
-        if(l_root_adjacent[k] != NULL) {
-          tsch_schedule_remove_link(sf_root, l_root_adjacent[k]);
-          l_root_adjacent[k] = NULL;
-        }
-        continue;
-      }
-      {
-        uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
-        uint16_t ts = cg_slot(kh, ORCHESTRA_IA_ROOT_PERIOD);
-        uint16_t ch = cg_channel(kh);
-        if(l_root_adjacent[k] == NULL) {
-          l_root_adjacent[k] = tsch_schedule_add_link(sf_root, LINK_OPTION_TX | LINK_OPTION_SHARED,
-                                                       LINK_TYPE_NORMAL, &orchestra_parent_linkaddr, ts, ch, 1);
-        } else {
-          linkaddr_copy(&l_root_adjacent[k]->addr, &orchestra_parent_linkaddr);
-          l_root_adjacent[k]->timeslot = ts;
-          l_root_adjacent[k]->channel_offset = ch;
-        }
-      }
-    }
-  }
+  cg_set_cells(sf_root, l_root_adjacent, want_shards, LINK_OPTION_TX | LINK_OPTION_SHARED,
+               &orchestra_parent_linkaddr,
+               ORCHESTRA_LINKADDR_HASH2(&orchestra_parent_linkaddr, &linkaddr_node_addr),
+               CG_ROOT_PERIOD);
 }
 /*---------------------------------------------------------------------------*/
 /* Rx cell(s) matching one direct child's own uplink cell(s): child c
@@ -718,35 +1002,12 @@ update_root_adjacent(void)
 static void
 update_child_relay_rx(struct cg_child *c)
 {
-  int k;
   uint8_t want_shards = c->shard_count > 0 ? c->shard_count : 1;
   if(sf_short == NULL) {
     return;
   }
-  {
-    uint32_t h = ORCHESTRA_LINKADDR_HASH2(&linkaddr_node_addr, &c->addr);
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(k >= want_shards) {
-        if(c->relay_rx[k] != NULL) {
-          tsch_schedule_remove_link(sf_short, c->relay_rx[k]);
-          c->relay_rx[k] = NULL;
-        }
-        continue;
-      }
-      {
-        uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
-        uint16_t ts = cg_slot(kh, TSCH_IA_SFS_SIZE);
-        uint16_t ch = cg_channel(kh);
-        if(c->relay_rx[k] == NULL) {
-          c->relay_rx[k] = tsch_schedule_add_link(sf_short, LINK_OPTION_RX, LINK_TYPE_NORMAL,
-                                                   &c->addr, ts, ch, 1);
-        } else {
-          c->relay_rx[k]->timeslot = ts;
-          c->relay_rx[k]->channel_offset = ch;
-        }
-      }
-    }
-  }
+  cg_set_cells(sf_short, c->relay_rx, want_shards, LINK_OPTION_RX, &c->addr,
+               ORCHESTRA_LINKADDR_HASH2(&linkaddr_node_addr, &c->addr), TSCH_IA_SFS_SIZE);
 }
 /*---------------------------------------------------------------------------*/
 /* The DAG root's own Rx side of a root-adjacent child's ROOT_ADJACENT
@@ -757,41 +1018,13 @@ update_child_relay_rx(struct cg_child *c)
 static void
 update_child_root_adjacent_rx(struct cg_child *c)
 {
-  int k;
   uint8_t want_shards = c->shard_count > 0 ? c->shard_count : 1;
   if(sf_root == NULL || !tsch_is_coordinator) {
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(c->root_adjacent_rx[k] != NULL) {
-        tsch_schedule_remove_link(sf_root, c->root_adjacent_rx[k]);
-        c->root_adjacent_rx[k] = NULL;
-      }
-    }
+    cg_clear_cells(sf_root, c->root_adjacent_rx);
     return;
   }
-  {
-    uint32_t h = ORCHESTRA_LINKADDR_HASH2(&linkaddr_node_addr, &c->addr);
-    for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-      if(k >= want_shards) {
-        if(c->root_adjacent_rx[k] != NULL) {
-          tsch_schedule_remove_link(sf_root, c->root_adjacent_rx[k]);
-          c->root_adjacent_rx[k] = NULL;
-        }
-        continue;
-      }
-      {
-        uint32_t kh = h + (uint32_t)k * 0x85EBCA6Bu;
-        uint16_t ts = cg_slot(kh, ORCHESTRA_IA_ROOT_PERIOD);
-        uint16_t ch = cg_channel(kh);
-        if(c->root_adjacent_rx[k] == NULL) {
-          c->root_adjacent_rx[k] = tsch_schedule_add_link(sf_root, LINK_OPTION_RX, LINK_TYPE_NORMAL,
-                                                           &c->addr, ts, ch, 1);
-        } else {
-          c->root_adjacent_rx[k]->timeslot = ts;
-          c->root_adjacent_rx[k]->channel_offset = ch;
-        }
-      }
-    }
-  }
+  cg_set_cells(sf_root, c->root_adjacent_rx, want_shards, LINK_OPTION_RX, &c->addr,
+               ORCHESTRA_LINKADDR_HASH2(&linkaddr_node_addr, &c->addr), CG_ROOT_PERIOD);
 }
 /*---------------------------------------------------------------------------*/
 /* Installs/updates whichever of update_child_relay_rx()/update_child_root_
@@ -848,6 +1081,25 @@ bootstrap_tick(void *ptr)
   ctimer_set(&bootstrap_timer, CG_BOOTSTRAP_CHECK_PERIOD, bootstrap_tick, NULL);
 }
 /*---------------------------------------------------------------------------*/
+/* Adopts shard count v that child c advertised in its EB -- unless c was
+ * reclaimed for being idle, in which case it stays at 1 until it sends
+ * real data again. Without that hold, c's very next EB (~15 s later) would
+ * restore every reclaimed cell while c is still silent. */
+static void
+cg_adopt_child_count(struct cg_child *c, uint8_t v)
+{
+#if CG_IDLE_RECLAIM
+  c->advertised = v;
+  if(c->reclaimed) {
+    return;
+  }
+#endif
+  if(c->shard_count != v) {
+    c->shard_count = v;
+    update_child(c);
+  }
+}
+/*---------------------------------------------------------------------------*/
 #if CG_IDLE_RECLAIM
 static struct ctimer idle_timer;
 /* TSCH_CALLBACK_UNICAST_DATA_INPUT: fires from tsch_rx_process_pending() for
@@ -863,18 +1115,71 @@ static struct ctimer idle_timer;
  * send for a while -- so a truly idle child, from the application's point
  * of view, looks maximally *active* to a tap that cannot see payload
  * length. TSCH_CALLBACK_UNICAST_DATA_INPUT fires after packetbuf is
- * populated, so packetbuf_datalen() lets us tell a real packet (own
- * traffic or relayed) from an empty keepalive and only count the former. */
+ * populated, so the frame can be inspected -- but packetbuf then holds the
+ * raw frame, MAC header included, so packetbuf_datalen() alone is never 0
+ * (an earlier version relied on that and counted every keepalive as
+ * activity); see cg_frame_is_app_data(). */
+/* Whether the frame in packetbuf carries application data (UDP), as
+ * opposed to an empty keepalive or RPL control traffic (ICMPv6 DAO/DIO/DIS/
+ * probes), which a node keeps sending to its parent while it has nothing
+ * to report. At TSCH_CALLBACK_UNICAST_DATA_INPUT time packetbuf still holds
+ * the whole raw frame, MAC header included, so it is parsed here first. A
+ * compressed IPv6 header (6LoWPAN IPHC) sets its NH bit only when the next
+ * header is compressed with NHC, which Contiki does for UDP and never for
+ * ICMPv6. */
+#if !CG_ABLATION_ANY_FRAME_ACTIVITY
+static int
+cg_frame_is_app_data(void)
+{
+  frame802154_t frame;
+  const uint8_t *p;
+  int len;
+
+  if(frame802154_parse(packetbuf_dataptr(), packetbuf_datalen(), &frame) == 0) {
+    return 0;
+  }
+  p = frame.payload;
+  len = frame.payload_len;
+  if(len <= 0) {
+    return 0; /* keepalive */
+  }
+  if((p[0] & 0xf8) == 0xe0) {
+    return 1; /* FRAGN: a piece of a datagram too large for control traffic */
+  }
+  if((p[0] & 0xf8) == 0xc0) { /* FRAG1: IPHC follows the 4-byte header */
+    if(len <= 4) {
+      return 0;
+    }
+    p += 4;
+  }
+  return (p[0] & 0xe0) == 0x60 && (p[0] & 0x04) != 0; /* IPHC with NH=1 */
+}
+#endif /* !CG_ABLATION_ANY_FRAME_ACTIVITY */
+/*---------------------------------------------------------------------------*/
 void
 cg_data_input(const linkaddr_t *source)
 {
   struct cg_child *c;
+#if CG_ABLATION_ANY_FRAME_ACTIVITY
   if(packetbuf_datalen() == 0) {
-    return; /* keepalive or other empty frame -- not evidence of real activity */
+    return; /* never true on the raw frame -- every frame counts (ablation) */
   }
+#else
+  if(!cg_frame_is_app_data()) {
+    return; /* keepalive or RPL control -- not evidence of real activity */
+  }
+#endif
   c = find_child(source);
   if(c != NULL) {
     c->heard_since_check = 1;
+    if(c->reclaimed) {
+      /* Active again: give back what it advertises. */
+      c->reclaimed = 0;
+      LOG_INFO("cg: child active again, restoring %u shards -- ", c->advertised);
+      LOG_INFO_LLADDR(&c->addr);
+      LOG_INFO_("\n");
+      cg_adopt_child_count(c, c->advertised > 0 ? c->advertised : 1);
+    }
   }
 }
 /*---------------------------------------------------------------------------*/
@@ -910,6 +1215,7 @@ idle_tick(void *ptr)
       LOG_INFO_LLADDR(&c->addr);
       LOG_INFO_("\n");
       c->shard_count = 1;
+      c->reclaimed = 1;
       update_child(c);
     }
   }
@@ -919,6 +1225,73 @@ idle_tick(void *ptr)
 /*---------------------------------------------------------------------------*/
 #if CG_LOAD_BONUS
 static struct ctimer load_timer;
+#if CG_LOAD_QUEUE_BASED
+static struct ctimer queue_timer;
+/* One slotframe of whichever slotframe our uplink cells are in, in clock
+ * ticks (rounded up): the time for all K_S of our cells to pass once. */
+static clock_time_t
+cg_slotframe_ticks(void)
+{
+  uint16_t len = tsch_roots_is_root(&orchestra_parent_linkaddr) ? CG_ROOT_PERIOD : TSCH_IA_SFS_SIZE;
+  uint32_t us = (uint32_t)len * RTIMERTICKS_TO_US(tsch_timing[tsch_ts_timeslot_length]);
+  clock_time_t t = (clock_time_t)(((uint64_t)us * CLOCK_SECOND + 999999) / 1000000);
+  return t > 0 ? t : 1; /* never a zero-period (busy-looping) timer */
+}
+/*---------------------------------------------------------------------------*/
+/* Every slotframe: shortage if more packets are queued to our parent than
+ * our installed uplink cells can send in one slotframe, at this sample and
+ * the previous one. Only sampled while our uplink cells are installed --
+ * before that, packets wait for a missing cell, not for more cells.
+ * Grants X_S immediately (fast rise). */
+static void
+queue_tick(void *ptr)
+{
+  int cells = list_length(tsch_roots_is_root(&orchestra_parent_linkaddr) ? l_root_adjacent : l_uplink);
+  int queued = 0;
+  uint8_t backlogged;
+
+  if(orchestra_parent_knows_us && cells > 0) {
+    struct tsch_neighbor *n = tsch_queue_get_nbr(&orchestra_parent_linkaddr);
+    if(n != NULL) {
+      queued = tsch_queue_nbr_packet_count(n);
+    }
+  }
+  backlogged = cells > 0 && queued > cells;
+  if(backlogged && last_backlogged) {
+    shortage_seen = 1;
+    quiet_windows = 0;
+    if(!own_load_bonus) {
+      LOG_INFO("cg: own load bonus granted (%d queued > %d cells, two slotframes)\n",
+               queued, cells);
+      own_load_bonus = 1;
+      update_uplink();
+      update_root_adjacent();
+    }
+  }
+  last_backlogged = backlogged;
+  ctimer_set(&queue_timer, cg_slotframe_ticks(), queue_tick, NULL);
+}
+/*---------------------------------------------------------------------------*/
+/* Every CG_LOAD_CHECK_PERIOD: release X_S once CG_LOAD_RELEASE_WINDOWS
+ * windows in a row have passed with no shortage at all (fall slow). */
+static void
+load_tick(void *ptr)
+{
+  if(shortage_seen) {
+    quiet_windows = 0;
+  } else if(quiet_windows < 255) {
+    quiet_windows++;
+  }
+  shortage_seen = 0;
+  if(own_load_bonus && quiet_windows >= CG_LOAD_RELEASE_WINDOWS) {
+    LOG_INFO("cg: own load bonus released (%u quiet windows)\n", quiet_windows);
+    own_load_bonus = 0;
+    update_uplink();
+    update_root_adjacent();
+  }
+  ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
+}
+#else /* CG_LOAD_QUEUE_BASED */
 /* Every CG_LOAD_CHECK_PERIOD: fold this window's own_load_tx_count into
  * own_load_ewma_q8 (fast-ish attack, slow decay -- see the constant
  * block's own comment), and if that estimate has stayed above
@@ -952,6 +1325,7 @@ load_tick(void *ptr)
   }
   ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
 }
+#endif /* CG_LOAD_QUEUE_BASED */
 #endif /* CG_LOAD_BONUS */
 /*---------------------------------------------------------------------------*/
 static void
@@ -982,20 +1356,11 @@ static void
 child_removed(const linkaddr_t *addr)
 {
   struct cg_child *c = find_child(addr);
-  int k;
   if(c == NULL) {
     return;
   }
-  for(k = 0; k < CG_RELAY_SHARDS_MAX; k++) {
-    if(c->relay_rx[k] != NULL) {
-      tsch_schedule_remove_link(sf_short, c->relay_rx[k]);
-      c->relay_rx[k] = NULL;
-    }
-    if(c->root_adjacent_rx[k] != NULL) {
-      tsch_schedule_remove_link(sf_root, c->root_adjacent_rx[k]);
-      c->root_adjacent_rx[k] = NULL;
-    }
-  }
+  cg_clear_cells(sf_short, c->relay_rx);
+  cg_clear_cells(sf_root, c->root_adjacent_rx);
   tsch_queue_free_packets_to(addr);
   c->in_use = 0;
   update_uplink();
@@ -1060,22 +1425,22 @@ select_packet(uint16_t *slotframe, uint16_t *timeslot, uint16_t *channel_offset)
      && linkaddr_cmp(dst, &orchestra_parent_linkaddr)
      && !linkaddr_cmp(dst, &linkaddr_null)) {
     if(tsch_roots_is_root(&orchestra_parent_linkaddr)) {
-      if(l_root_adjacent[0] != NULL) {
+      if(list_head(l_root_adjacent) != NULL) {
         *slotframe = sf_root->handle;
         *timeslot = 0xffff;
         *channel_offset = 0xffff;
-#if CG_LOAD_BONUS
+#if CG_LOAD_BONUS && !CG_LOAD_QUEUE_BASED
         own_load_tx_count++;
 #endif
         return 1;
       }
       return 0;
     }
-    if(l_uplink[0] != NULL) {
+    if(list_head(l_uplink) != NULL) {
       *slotframe = sf_short->handle;
       *timeslot = 0xffff;
       *channel_offset = 0xffff;
-#if CG_LOAD_BONUS
+#if CG_LOAD_BONUS && !CG_LOAD_QUEUE_BASED
       own_load_tx_count++;
 #endif
       return 1;
@@ -1089,11 +1454,14 @@ init(uint16_t sf_handle)
 {
   int i;
   slotframe_handle = sf_handle;
+  memb_init(&cg_cell_memb);
+  list_init(l_uplink);
+  list_init(l_root_adjacent);
   for(i = 0; i < CG_MAX_CHILDREN; i++) {
     children[i].in_use = 0;
   }
   sf_short = tsch_schedule_add_slotframe(slotframe_handle, TSCH_IA_SFS_SIZE);
-  sf_root = tsch_schedule_add_slotframe(slotframe_handle | 0x4000, ORCHESTRA_IA_ROOT_PERIOD);
+  sf_root = tsch_schedule_add_slotframe(slotframe_handle | 0x4000, CG_ROOT_PERIOD);
   if(sf_short == NULL) {
     LOG_ERR("cg: failed to add the shared slotframe\n");
   }
@@ -1105,9 +1473,16 @@ init(uint16_t sf_handle)
   ctimer_set(&idle_timer, CG_IDLE_CHECK_PERIOD, idle_tick, NULL);
 #endif
 #if CG_LOAD_BONUS
+  own_load_bonus = 0;
+#if CG_LOAD_QUEUE_BASED
+  last_backlogged = 0;
+  shortage_seen = 0;
+  quiet_windows = 0;
+  ctimer_set(&queue_timer, cg_slotframe_ticks(), queue_tick, NULL);
+#else
   own_load_tx_count = 0;
   own_load_ewma_q8 = 0;
-  own_load_bonus = 0;
+#endif
   ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
 #endif
 #if CG_HOLD_BEFORE_USE
@@ -1115,18 +1490,21 @@ init(uint16_t sf_handle)
 #endif
 }
 /*---------------------------------------------------------------------------*/
-/* TSCH_CALLBACK_IA_OWN_CHILDREN: fired from tsch_packet_create_eb() to fetch
- * our own direct children's addresses for inclusion in our EB, reusing
- * orchestra-rule-implicit-ack.c's existing wire format exactly -- one byte
- * per child. Every entry carries the *same* value, this node's own overall
- * shard count (cg_own_shard_count()) -- not a per-child value, since there
- * is nothing to differentiate any more: this node has exactly one shard
- * count, used for its one uplink relationship with its own parent. */
+/* TSCH_CALLBACK_IA_OWN_CHILDREN: fired from tsch_packet_create_eb() to fill
+ * our EB's children-list IE, reusing orchestra-rule-implicit-ack.c's wire
+ * format. This node has exactly one shard count K_S (cg_own_shard_count()),
+ * for its one uplink relationship with its own parent, so it is sent as
+ * exactly ONE entry (our own address + K_S) -- always, even with no
+ * children. Earlier versions wrote one entry per child, all carrying the
+ * same value, which meant (a) a leaf sent an empty list and its parent never
+ * learned its K_S, so a leaf's load-bonus shard was transmitted on a cell
+ * the parent never listened on, and (b) the IE's TSCH_IA_IE_MAX_CHILDREN
+ * limit bounded EB size by child count for no benefit. The parent only
+ * reads entry 0 and keys on the EB's source address (cg_child_eb_input()),
+ * so the entry's address field is informational. */
 uint8_t
 cg_get_own_children(linkaddr_t *out, uint8_t *out_shard_count, uint8_t max_children)
 {
-  int i;
-  uint8_t n = 0;
   uint8_t own_shards = cg_own_shard_count();
 #if CG_HOLD_BEFORE_USE
   /* This EB is about to state own_shards -- record it as announced
@@ -1136,14 +1514,19 @@ cg_get_own_children(linkaddr_t *out, uint8_t *out_shard_count, uint8_t max_child
    * same way). */
   announced_shards = own_shards;
 #endif
-  for(i = 0; i < CG_MAX_CHILDREN && n < max_children; i++) {
-    if(children[i].in_use) {
-      linkaddr_copy(&out[n], &children[i].addr);
-      out_shard_count[n] = own_shards;
-      n++;
-    }
+  if(max_children == 0) {
+    return 0;
   }
-  return n;
+  linkaddr_copy(&out[0], &linkaddr_node_addr);
+  out_shard_count[0] = own_shards;
+#if CG_ABLATION_SUBTREE_COUNT
+  if(max_children >= 2) {
+    linkaddr_copy(&out[1], &linkaddr_node_addr);
+    out_shard_count[1] = cg_own_descendants();
+    return 2;
+  }
+#endif
+  return 1;
 }
 /*---------------------------------------------------------------------------*/
 /* TSCH_CALLBACK_IA_CHILD_EB: fired from eb_input() for every received EB;
@@ -1182,6 +1565,13 @@ cg_child_eb_input(const linkaddr_t *source, const linkaddr_t *children_list,
   if(c == NULL || num_children == 0) {
     return;
   }
+#if CG_ABLATION_SUBTREE_COUNT
+  if(num_children >= 2 && c->descendants != children_shard_count[1]) {
+    c->descendants = children_shard_count[1];
+    update_uplink();
+    update_root_adjacent();
+  }
+#endif
   {
     uint8_t reported = children_shard_count[0] > 0 ? children_shard_count[0] : 1;
 #if CG_EWMA_SHARD_COUNT
@@ -1200,15 +1590,9 @@ cg_child_eb_input(const linkaddr_t *source, const linkaddr_t *children_list,
     } else if(smoothed > CG_RELAY_SHARDS_MAX) {
       smoothed = CG_RELAY_SHARDS_MAX;
     }
-    if(c->shard_count != smoothed) {
-      c->shard_count = smoothed;
-      update_child(c);
-    }
+    cg_adopt_child_count(c, smoothed);
 #else
-    if(c->shard_count != reported) {
-      c->shard_count = reported;
-      update_child(c);
-    }
+    cg_adopt_child_count(c, reported);
 #endif
   }
 }
