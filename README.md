@@ -20,7 +20,6 @@ APAS combines four mechanisms:
 | **Structural floor** (`K_S = min(m_S + 1, K_max)`) | Grants a node cells the instant a child joins, sized by its direct child count, before that child ever transmits. |
 | **Asymmetric load estimation** | Lets a genuinely busy node earn one extra cell from its own recent traffic, using a fast-rise/slow-fall EWMA so a single busy window doesn't cost a still-needed cell later. |
 | **Idle reclaim** | Shrinks a child's cells back to its guaranteed minimum after sustained silence, freeing capacity for other nodes without waiting for RPL to remove it. |
-| **Rank-aware cap** | Gives nodes near the border router (BR) a larger cap (`K_max = 6` vs. `4`), since their traffic converges from many subtrees at once. |
 
 ## Repository layout
 
@@ -36,18 +35,8 @@ examples/6tisch/
 
 
 
-## Real hardware deployment (FIT IoT-LAB)
+## Real hardware deployment (TI CC2652R)
 
-APAS is also validated on real hardware: FIT IoT-LAB, Grenoble site, m3 boards (STM32F103RE + AT86RF231), 4-channel hopping ({15, 20, 25, 26}), −17 dBm TX power. Build for the `iotlab` target with the ARM GCC 10.3-2021.10 toolchain (pinned in `tools/docker/Dockerfile`):
-
-```bash
-cd examples/6tisch/apas-iotlab-m3       # or apas-iotlab-m3-150node for the 150-node deployment
-make TARGET=iotlab BOARD=m3
-iotlab-experiment submit -n apas-node -d <duration> -l grenoble,m3,<node-range>,build/iotlab/m3/node.iotlab
-iotlab-node -i <experiment-id> --flash build/iotlab/m3/node.iotlab -l grenoble,m3,<node-range>
-```
-
-Each node's real MAC address is mapped to a logical id (1 = root) via `deployment-map.c` and the `services/deployment` module — a node prints its own MAC and role over serial on boot and every 30 seconds thereafter, which is how `deployment-map.c` is populated with real hardware addresses.
 
 ## Comparison with existing schedulers
 
