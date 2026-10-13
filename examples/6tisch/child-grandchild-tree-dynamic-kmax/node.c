@@ -27,7 +27,46 @@
  * SUCH DAMAGE.
  *
  */
-
+/**
+ * \file
+ *         Smoke-test node for the autonomous implicit-ack tree scheduler
+ *         (os/services/orchestra/orchestra-rule-implicit-ack.c), extended
+ *         with hop-by-hop in-network aggregation of the application traffic
+ *         itself.
+ *
+ *         Motivation: RELAY_TX shards (see orchestra-rule-implicit-ack.c)
+ *         give any one parent-child relationship at most a fixed, small
+ *         multiplier (ORCHESTRA_IA_RELAY_TX_SHARDS) of extra capacity. Near
+ *         the root, traffic fans in from an entire subtree, and subtree size
+ *         grows with network size -- so past some scale, some node's
+ *         aggregate arrival rate exceeds what any fixed multiplier can
+ *         drain, and packets are dropped at the TSCH queue (tsch_queue_add_
+ *         packet() failing outright, "can't send packet ... queue 128/128"),
+ *         not at the radio. Adding more parallel cells cannot fix this in
+ *         general; the fix here instead reduces how many separate
+ *         transmissions are needed to move the same amount of application
+ *         data, by combining multiple nodes' tiny reports into one frame per
+ *         hop instead of relaying each one individually.
+ *
+ *         Every non-root node still originates its own periodic report
+ *         exactly as before, but instead of addressing it directly to the
+ *         root (which stock 6LoWPAN/RPL would then transparently forward,
+ *         hop by hop, entirely below the application), it now always
+ *         addresses its own current aggregate to its own immediate RPL
+ *         parent, and every node -- not just the root -- terminates and
+ *         inspects the UDP payload it receives: it unpacks whatever reports
+ *         a child just relayed, folds them into its own outgoing aggregate
+ *         buffer alongside its own report, and periodically flushes that
+ *         combined buffer as a single packet to its own parent. The root is
+ *         simply the node for which "next hop" has no further hop: it
+ *         unpacks and logs each item instead of forwarding it onward. This
+ *         only ever changes application-layer packet counts and payload
+ *         sizes -- it does not touch ROOT_ADJACENT, UPLINK, RELAY_TX,
+ *         SELF_OVERHEAR, or the implicit-ack confirmation mechanism, all of
+ *         which keep operating exactly as before on whatever the
+ *         application now hands them.
+ *
+ */
 
 #include "contiki.h"
 #include "sys/node-id.h"
@@ -50,8 +89,8 @@
 #if defined(APP_CONF_SEND_INTERVAL_MS)
 /* Exact interval in ms (e.g. 7500 for 8 readings/min), used by the APAS-only sweeps. */
 #define SEND_INTERVAL ((clock_time_t)((uint32_t)APP_CONF_SEND_INTERVAL_MS * CLOCK_SECOND / 1000))
-#elif defined(ATAS_CONF_SEND_INTERVAL_S)
-#define SEND_INTERVAL (ATAS_CONF_SEND_INTERVAL_S * CLOCK_SECOND)
+#elif defined(IADS_CONF_SEND_INTERVAL_S)
+#define SEND_INTERVAL (IADS_CONF_SEND_INTERVAL_S * CLOCK_SECOND)
 #else
 #define SEND_INTERVAL (15 * CLOCK_SECOND)
 #endif
@@ -61,19 +100,27 @@
  * IEEE address): build the root image with `make ROOT=1`. */
 #if CONTIKI_TARGET_COOJA
 #define NODE_IS_ROOT (node_id == 1)
-#elif defined(ATAS_CONF_IS_ROOT)
-#define NODE_IS_ROOT ATAS_CONF_IS_ROOT
+#elif defined(IADS_CONF_IS_ROOT)
+#define NODE_IS_ROOT IADS_CONF_IS_ROOT
 #else
 #define NODE_IS_ROOT 0
 #endif
 
-
-#ifdef ATAS_CONF_TELEMETRY
-#define ATAS_TELEMETRY ATAS_CONF_TELEMETRY
+/* Testbed telemetry (hardware default; Cooja keeps the original 3-byte items
+ * and log lines). On hardware node_id is 16-bit, so an item carries a 16-bit
+ * origin (the 8-bit one would alias boards, e.g. 0xdebc and 0x63bc), plus the
+ * low 16 bits of the ASN at which the origin generated it, for end-to-end
+ * latency at the root (unwrapped there against the reception ASN; valid for
+ * latencies under 2^16 slots). The root logs one IADS-RX line per item and an
+ * IADS-CLK (ASN, time) sample every second; every node also sends an
+ * IADS-STAT report (RDC counters, rank, parent) straight to the root every
+ * STATS_INTERVAL on STATS_PORT. Parse the root's log with hw/analyze.py. */
+#ifdef IADS_CONF_TELEMETRY
+#define IADS_TELEMETRY IADS_CONF_TELEMETRY
 #else
-#define ATAS_TELEMETRY (!CONTIKI_TARGET_COOJA)
+#define IADS_TELEMETRY (!CONTIKI_TARGET_COOJA)
 #endif
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
 #define STATS_PORT (UDP_PORT + 1)
 #define STATS_INTERVAL (120 * CLOCK_SECOND)
 #define ITEM_WIRE 6  /* origin(2) seq(2) asn16(2) */
@@ -81,9 +128,37 @@
 #define ITEM_WIRE 3  /* origin(1) seq(2) */
 #endif
 
-
+/* Aggregation parameters. Each item is (origin node id, origin's own
+ * sequence number): 1 + 2 = 3 bytes on the wire. AGG_FLUSH_INTERVAL trades
+ * added latency (how long an item may sit in an intermediate node's buffer
+ * before being forwarded) against how many items typically get bundled into
+ * one outgoing frame.
+ *
+ * MAX_AGG_ITEMS was originally set to 16 (49 wire bytes) purely to stay
+ * comfortably clear of one 802.15.4 frame's usable payload after 6LoWPAN/
+ * IPv6/UDP compression overhead. Measurement at 100/150 nodes showed that
+ * value was actually far too conservative for a different reason entirely:
+ * "IATRACE agg overflow-drop" (add_item()'s forced drop-oldest fallback,
+ * originally meant only for the rare bootstrap case of no route yet) was
+ * firing thousands of times over a single run -- 6357 times at 100 nodes --
+ * driven by "IATRACE agg defer-global" (the node-wide TSCH packet pool
+ * being full) firing *8071* times, meaning the underlying congestion
+ * routinely outlasted a 16-item buffer's capacity to simply wait it out.
+ * Raising this to 24 (73 wire bytes, confirmed fragmentation-free) let
+ * PDR nearly double at 100 nodes (20.2%->39.4%) and more than double at 150
+ * (10.5%->23.2%), simply by giving pending items more headroom to survive a
+ * sustained congestion episode without being dropped. 32 (97 wire bytes)
+ * was also tried and made things much worse (150 nodes: 23.2%->8.4%): it
+ * crosses the actual single-frame payload budget once 6LoWPAN/IPv6/UDP
+ * headers are added, confirmed by 6LoWPAN fragmentation appearing in the
+ * log (1071 occurrences, versus zero at 24) -- a fragmented aggregate needs
+ * every fragment to arrive for the whole batch to reassemble, turning one
+ * lost frame into a lost aggregate instead of one lost item. 24 is the
+ * validated sweet spot: as large as tested without crossing into
+ * fragmentation, and already a large, measured win over the original,
+ * overly-conservative value. */
 #define AGG_FLUSH_INTERVAL (5 * CLOCK_SECOND)
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
 /* 6-byte items: 12 keeps the same 73-byte, fragmentation-free frame */
 #define MAX_AGG_ITEMS 12
 #else
@@ -91,13 +166,25 @@
 #endif
 #define AGG_WIRE_MAX (1 + MAX_AGG_ITEMS * ITEM_WIRE)
 
-
+/* EWMA-predicted congestion toward our own parent, in percent occupancy of
+ * that neighbor's TSCH queue (0..100). A raw, instantaneous occupancy check
+ * only ever tells us "full right now" -- by the time that is true, a send
+ * attempt is essentially guaranteed to be wasted or, worse, contend for the
+ * one slot that frees up right as some other node's packet also arrives.
+ * Smoothing it into an EWMA instead answers a different, more useful
+ * question -- "has this link been *trending* congested over the last
+ * several flush cycles" -- which is what we actually want in order to
+ * decide how much to risk bundling into a single frame *before* the queue
+ * is already full, not just react once it is. EWMA_SHIFT=3 gives new
+ * samples 1/8 weight (~8 flush cycles, ~40s, to mostly settle to a new
+ * steady state) -- smooth enough to ignore one-off blips, responsive enough
+ * to track a real, sustained shift within well under a minute. */
 #define EWMA_SHIFT 3
 #define CONGESTION_HIGH_PCT 50
 #define CONGESTION_SMALL_CAP 4
 
 typedef struct {
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
   uint16_t origin;
   uint16_t seq;
   uint16_t asn16;
@@ -108,10 +195,10 @@ typedef struct {
 } agg_item_t;
 
 static struct simple_udp_connection udp_conn;
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
 static struct simple_udp_connection stats_conn;
 
-struct atas_stat {
+struct iads_stat {
   uint16_t rank;
   uint16_t parent;      /* node ID of our time source (RPL parent) */
   uint32_t uptime_ms;
@@ -135,7 +222,7 @@ now_us(void)
   last = now;
   return ((high + now) * 1000000ULL) / RTIMER_SECOND;
 }
-#endif /* ATAS_TELEMETRY */
+#endif /* IADS_TELEMETRY */
 static agg_item_t agg_buf[MAX_AGG_ITEMS];
 static uint8_t agg_count;
 static unsigned own_seq;
@@ -168,6 +255,12 @@ print_rdc(void)
               (unsigned long)((100ULL * (d_transmit + d_listen)) / d_total),
               (unsigned long)(total > 0 ? (100ULL * transmit) / total : 0),
               (unsigned long)(total > 0 ? (100ULL * listen) / total : 0));
+  }
+
+  if(d_total > 0) {
+    /* Same interval, radio-on share in 1/1000 % (the line above truncates to
+     * whole percent, which is coarse at a 2-3 % duty cycle). */
+    LOG_INFO("RDCm %lu\n", (unsigned long)((100000ULL * (d_transmit + d_listen)) / d_total));
   }
 
   last_transmit = transmit;
@@ -262,7 +355,7 @@ flush_aggregate(void)
   wire[0] = n_to_send;
   for(i = 0; i < n_to_send; i++) {
     uint8_t *w = &wire[1 + i * ITEM_WIRE];
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
     w[0] = (uint8_t)(agg_buf[i].origin & 0xff);
     w[1] = (uint8_t)(agg_buf[i].origin >> 8);
     w[2] = (uint8_t)(agg_buf[i].seq & 0xff);
@@ -287,7 +380,7 @@ flush_aggregate(void)
 }
 /*---------------------------------------------------------------------------*/
 static void
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
 add_item(uint16_t origin, uint16_t seq, uint16_t asn16)
 #else
 add_item(uint8_t origin, uint16_t seq)
@@ -306,7 +399,7 @@ add_item(uint8_t origin, uint16_t seq)
   }
   agg_buf[agg_count].origin = origin;
   agg_buf[agg_count].seq = seq;
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
   agg_buf[agg_count].asn16 = asn16;
 #endif
   agg_count++;
@@ -342,7 +435,7 @@ udp_rx_callback(struct simple_udp_connection *c,
   }
   for(i = 0; i < n; i++) {
     const uint8_t *w = &data[1 + i * ITEM_WIRE];
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
     uint16_t origin = (uint16_t)(w[0] | (w[1] << 8));
     uint16_t seq = (uint16_t)(w[2] | (w[3] << 8));
     uint16_t asn16 = (uint16_t)(w[4] | (w[5] << 8));
@@ -353,14 +446,14 @@ udp_rx_callback(struct simple_udp_connection *c,
     if(NODE_IS_ROOT) {
       LOG_INFO("received 4 bytes (seq %u) from fd00::%x:%x:%x:%x\n",
                 seq, origin, origin, origin, origin);
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
       /* One line per item for hw/analyze.py (asn_tx16 is unwrapped there) */
-      LOG_INFO("ATAS-RX src=%u seq=%u asn_tx16=%u asn_rx=%u:%lu t_us=%llu len=%u\n",
+      LOG_INFO("IADS-RX src=%u seq=%u asn_tx16=%u asn_rx=%u:%lu t_us=%llu len=%u\n",
                origin, seq, asn16, tsch_current_asn.ms1b,
                (unsigned long)tsch_current_asn.ls4b, (unsigned long long)now_us(), ITEM_WIRE);
 #endif
     } else {
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
       add_item(origin, seq, asn16);
 #else
       add_item(origin, seq);
@@ -368,7 +461,7 @@ udp_rx_callback(struct simple_udp_connection *c,
     }
   }
 }
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
 /*---------------------------------------------------------------------------*/
 static void
 stats_rx_callback(struct simple_udp_connection *c,
@@ -376,12 +469,12 @@ stats_rx_callback(struct simple_udp_connection *c,
                   const uip_ipaddr_t *receiver_addr, uint16_t receiver_port,
                   const uint8_t *data, uint16_t datalen)
 {
-  struct atas_stat s;
+  struct iads_stat s;
   if(!NODE_IS_ROOT || datalen != sizeof(s)) {
     return;
   }
   memcpy(&s, data, sizeof(s));
-  LOG_INFO("ATAS-STAT src=%u rank=%u parent=%u up_ms=%lu tx_ms=%lu rx_ms=%lu own_seq=%u t_us=%llu\n",
+  LOG_INFO("IADS-STAT src=%u rank=%u parent=%u up_ms=%lu tx_ms=%lu rx_ms=%lu own_seq=%u t_us=%llu\n",
            (unsigned)((sender_addr->u8[14] << 8) | sender_addr->u8[15]), s.rank, s.parent,
            (unsigned long)s.uptime_ms, (unsigned long)s.radio_tx_ms, (unsigned long)s.radio_rx_ms,
            s.own_seq, (unsigned long long)now_us());
@@ -390,7 +483,7 @@ stats_rx_callback(struct simple_udp_connection *c,
 static void
 send_stats(void)
 {
-  struct atas_stat s;
+  struct iads_stat s;
   uip_ipaddr_t root;
   struct tsch_neighbor *n = tsch_queue_get_time_source();
   const linkaddr_t *ts = n != NULL ? tsch_queue_get_nbr_address(n) : NULL;
@@ -408,20 +501,20 @@ send_stats(void)
   s.own_seq = (uint16_t)own_seq;
   simple_udp_sendto(&stats_conn, &s, sizeof(s), &root);
 }
-#endif /* ATAS_TELEMETRY */
+#endif /* IADS_TELEMETRY */
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(node_process, ev, data)
 {
   static struct etimer et_send;
   static struct etimer et_flush;
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
   static struct etimer et_stats;
 #endif
 
   PROCESS_BEGIN();
 
   simple_udp_register(&udp_conn, UDP_PORT, NULL, UDP_PORT, udp_rx_callback);
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
   simple_udp_register(&stats_conn, STATS_PORT, NULL, STATS_PORT, stats_rx_callback);
 #endif
 
@@ -433,22 +526,22 @@ PROCESS_THREAD(node_process, ev, data)
   if(NODE_IS_ROOT) {
     /* The root only receives (and terminates) application data in this
      * test; it must not also run the periodic sender/aggregator below. */
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
     /* (ASN, time) samples on the root's clock, for latency in analyze.py */
     etimer_set(&et_send, CLOCK_SECOND);
     while(1) {
       PROCESS_YIELD_UNTIL(etimer_expired(&et_send));
       etimer_reset(&et_send);
-      LOG_INFO("ATAS-CLK asn=%u:%lu t_us=%llu\n", tsch_current_asn.ms1b,
+      LOG_INFO("IADS-CLK asn=%u:%lu t_us=%llu\n", tsch_current_asn.ms1b,
                (unsigned long)tsch_current_asn.ls4b, (unsigned long long)now_us());
     }
-#endif /* ATAS_TELEMETRY */
+#endif /* IADS_TELEMETRY */
     PROCESS_WAIT_EVENT_UNTIL(0);
   }
 
   etimer_set(&et_send, SEND_INTERVAL);
   etimer_set(&et_flush, AGG_FLUSH_INTERVAL);
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
   etimer_set(&et_stats, STATS_INTERVAL);
 #endif
   while(1) {
@@ -464,7 +557,7 @@ PROCESS_THREAD(node_process, ev, data)
 #endif
          ) {
         LOG_INFO("sending %u to root\n", own_seq);
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
         add_item((uint16_t)node_id, (uint16_t)own_seq, (uint16_t)tsch_current_asn.ls4b);
 #else
         add_item((uint8_t)node_id, (uint16_t)own_seq);
@@ -478,7 +571,7 @@ PROCESS_THREAD(node_process, ev, data)
       etimer_reset(&et_flush);
       flush_aggregate();
     }
-#if ATAS_TELEMETRY
+#if IADS_TELEMETRY
     if(etimer_expired(&et_stats)) {
       etimer_reset(&et_stats);
       send_stats();
