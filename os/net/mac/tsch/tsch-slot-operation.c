@@ -947,6 +947,15 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
     if(!packet_seen) {
       /* no packets on air */
       tsch_radio_off(TSCH_RADIO_CMD_OFF_FORCE);
+#if TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING
+      /* Re-enable HW address filtering disabled above for an overhear cell,
+       * or it stays off for every following Rx slot. */
+      if(current_link != NULL && (current_link->link_options & LINK_OPTION_IA_OVERHEAR)) {
+        radio_value_t radio_rx_mode;
+        NETSTACK_RADIO.get_value(RADIO_PARAM_RX_MODE, &radio_rx_mode);
+        NETSTACK_RADIO.set_value(RADIO_PARAM_RX_MODE, radio_rx_mode | RADIO_RX_MODE_ADDRESS_FILTER);
+      }
+#endif /* TSCH_WITH_IMPLICIT_ACK && TSCH_HW_FRAME_FILTERING */
     } else {
       TSCH_DEBUG_RX_EVENT();
       /* Save packet timestamp */
@@ -998,6 +1007,15 @@ PT_THREAD(tsch_rx_slot(struct pt *pt, struct rtimer *t))
               snprintf(log->message, sizeof(log->message),
               "!failed to parse frame %u %u", header_len, current_input->len));
         }
+
+#ifdef TSCH_RX_RSSI_MIN
+        /* Emulated shorter radio range: frames from a neighbour whose averaged
+         * RSSI is below the threshold are treated as never received (no ACK,
+         * no overhear, no sync). */
+        if(frame_valid && !tsch_rssi_filter_accept(&source_address, current_input->rssi)) {
+          frame_valid = 0;
+        }
+#endif /* TSCH_RX_RSSI_MIN */
 
         if(frame_valid) {
           if(frame.fcf.frame_type != FRAME802154_DATAFRAME

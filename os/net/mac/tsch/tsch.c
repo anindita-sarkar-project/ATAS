@@ -172,6 +172,56 @@ static void packet_input(void);
 /* Getters and setters */
 
 /*---------------------------------------------------------------------------*/
+#ifdef TSCH_RX_RSSI_MIN
+/* Per-neighbour averaged RSSI for the emulated-range link filter. Called from
+ * the slot-operation ISR and, only while not associated (no slot operation
+ * running), from the scan loop -- never concurrently. */
+static struct {
+  linkaddr_t addr;
+  int16_t avg16;   /* EWMA of RSSI, in 1/16 dBm */
+  uint8_t count;   /* frames heard, saturating */
+  uint8_t accepted;
+  uint16_t age;    /* for replacement: bumped on every call */
+} rssi_nbrs[TSCH_RX_RSSI_NBRS];
+static uint16_t rssi_clock;
+
+int
+tsch_rssi_filter_accept(const linkaddr_t *src, int16_t rssi)
+{
+  int i, slot = -1, oldest = 0;
+  rssi_clock++;
+  for(i = 0; i < TSCH_RX_RSSI_NBRS; i++) {
+    if(rssi_nbrs[i].count > 0 && linkaddr_cmp(&rssi_nbrs[i].addr, src)) {
+      slot = i;
+      break;
+    }
+    if(rssi_nbrs[i].count == 0
+       || (uint16_t)(rssi_clock - rssi_nbrs[i].age) > (uint16_t)(rssi_clock - rssi_nbrs[oldest].age)) {
+      oldest = i;
+    }
+  }
+  if(slot < 0) {
+    slot = oldest;
+    linkaddr_copy(&rssi_nbrs[slot].addr, src);
+    rssi_nbrs[slot].avg16 = rssi * 16;
+    rssi_nbrs[slot].count = 0;
+    rssi_nbrs[slot].accepted = 0;
+  } else {
+    rssi_nbrs[slot].avg16 += (rssi * 16 - rssi_nbrs[slot].avg16) / 8;
+  }
+  rssi_nbrs[slot].age = rssi_clock;
+  if(rssi_nbrs[slot].count < 255) {
+    rssi_nbrs[slot].count++;
+  }
+  if(rssi_nbrs[slot].avg16 >= (TSCH_RX_RSSI_MIN + TSCH_RX_RSSI_HYST) * 16) {
+    rssi_nbrs[slot].accepted = 1;
+  } else if(rssi_nbrs[slot].avg16 < (TSCH_RX_RSSI_MIN - TSCH_RX_RSSI_HYST) * 16) {
+    rssi_nbrs[slot].accepted = 0;
+  }
+  return rssi_nbrs[slot].accepted && rssi_nbrs[slot].count >= TSCH_RX_RSSI_MIN_SAMPLES;
+}
+#endif /* TSCH_RX_RSSI_MIN */
+/*---------------------------------------------------------------------------*/
 void
 tsch_set_coordinator(int enable)
 {
@@ -575,6 +625,11 @@ tsch_rx_process_pending()
 
     if(is_data) {
       /* Copy payload to packetbuf for processing */
+#if TSCH_LOG_RX_RSSI
+      LOG_INFO("RX rssi %d dBm ch %u from ", current_input->rssi, current_input->channel);
+      LOG_INFO_LLADDR((const linkaddr_t *)frame.src_addr);
+      LOG_INFO_("\n");
+#endif /* TSCH_LOG_RX_RSSI */
       packetbuf_copyfrom(current_input->payload, current_input->len);
       packetbuf_set_attr(PACKETBUF_ATTR_RSSI, current_input->rssi);
       packetbuf_set_attr(PACKETBUF_ATTR_CHANNEL, current_input->channel);
@@ -593,6 +648,11 @@ tsch_rx_process_pending()
       packetbuf_set_attr(PACKETBUF_ATTR_RSSI, current_input->rssi);
       packetbuf_set_attr(PACKETBUF_ATTR_CHANNEL, current_input->channel);
       link_stats_input_callback((const linkaddr_t *)frame.src_addr);
+#if TSCH_LOG_EB_RSSI
+      LOG_INFO("EB rssi %d dBm ch %u from ", current_input->rssi, current_input->channel);
+      LOG_INFO_LLADDR((const linkaddr_t *)frame.src_addr);
+      LOG_INFO_("\n");
+#endif /* TSCH_LOG_EB_RSSI */
 
       /* Process EB without copying the payload to packetbuf */
       eb_input(current_input);
@@ -904,13 +964,24 @@ PT_THREAD(tsch_scan(struct pt *pt))
       input_eb.len = NETSTACK_RADIO.read(input_eb.payload, TSCH_PACKET_MAX_LEN);
 
       if(input_eb.len > 0) {
+        radio_value_t scan_rssi;
         /* Save packet timestamp */
         NETSTACK_RADIO.get_object(RADIO_PARAM_LAST_PACKET_TIMESTAMP, &t0, sizeof(rtimer_clock_t));
+        NETSTACK_RADIO.get_value(RADIO_PARAM_LAST_RSSI, &scan_rssi);
         t1 = RTIMER_NOW();
 
         /* Parse EB and attempt to associate */
-        LOG_INFO("scan: received packet (%u bytes) on channel %u\n", input_eb.len, current_channel);
+        LOG_INFO("scan: received packet (%u bytes) on channel %u, rssi %d\n",
+                 input_eb.len, current_channel, (int)scan_rssi);
 
+#ifdef TSCH_RX_RSSI_MIN
+        frame802154_t scan_frame;
+        if(frame802154_parse(input_eb.payload, input_eb.len, &scan_frame) == 0
+           || !tsch_rssi_filter_accept((const linkaddr_t *)scan_frame.src_addr, scan_rssi)) {
+          LOG_INFO("scan: ignoring EB, sender's average RSSI below threshold %d (or too few samples)\n",
+                   TSCH_RX_RSSI_MIN);
+        } else
+#endif /* TSCH_RX_RSSI_MIN */
         /* Sanity-check the timestamp */
         if(ABS(RTIMER_CLOCK_DIFF(t0, t1)) < 2ul * RTIMER_SECOND) {
           tsch_associate(&input_eb, t0);

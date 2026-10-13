@@ -439,6 +439,15 @@ void tsch_schedule_keepalive(int immediate);
   * \return The network uptime, or -1 if the node is not part of a TSCH network.
   */
 uint64_t tsch_get_network_uptime_ticks(void);
+
+#ifdef TSCH_RX_RSSI_MIN
+/**
+ * \brief Emulated-range link filter: feed one received frame's RSSI and
+ * return whether frames from this neighbour count as received. Decides on
+ * the neighbour's averaged RSSI (with hysteresis), not the single frame.
+ */
+int tsch_rssi_filter_accept(const linkaddr_t *src, int16_t rssi);
+#endif /* TSCH_RX_RSSI_MIN */
 /**
   * Leave the TSCH network we are currently in
   */

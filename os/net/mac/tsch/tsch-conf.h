@@ -495,6 +495,48 @@ by default, useful in case of duplicate seqno */
 #define TSCH_HW_FRAME_FILTERING 1
 #endif /* TSCH_CONF_HW_FRAME_FILTERING */
 
+/* Minimum RSSI (dBm) for a received frame to count at all, to emulate a
+ * shorter radio range on a real testbed. Frames below it are dropped in the
+ * slot (no ACK, overhear or sync) and ignored while scanning for EBs.
+ * Undefined by default: no filtering. */
+#ifdef TSCH_CONF_RX_RSSI_MIN
+#define TSCH_RX_RSSI_MIN TSCH_CONF_RX_RSSI_MIN
+#endif /* TSCH_CONF_RX_RSSI_MIN */
+
+/* The threshold applies to each neighbour's averaged RSSI (EWMA, 1/8 weight
+ * per frame): a neighbour is accepted once its average is >= MIN + HYST and
+ * dropped once it falls below MIN - HYST, and never before MIN_SAMPLES frames
+ * were heard from it, so one lucky EB can't pull in a far neighbour. */
+#ifdef TSCH_CONF_RX_RSSI_HYST
+#define TSCH_RX_RSSI_HYST TSCH_CONF_RX_RSSI_HYST
+#else
+#define TSCH_RX_RSSI_HYST 2
+#endif
+#ifdef TSCH_CONF_RX_RSSI_MIN_SAMPLES
+#define TSCH_RX_RSSI_MIN_SAMPLES TSCH_CONF_RX_RSSI_MIN_SAMPLES
+#else
+#define TSCH_RX_RSSI_MIN_SAMPLES 3
+#endif
+#ifdef TSCH_CONF_RX_RSSI_NBRS
+#define TSCH_RX_RSSI_NBRS TSCH_CONF_RX_RSSI_NBRS
+#else
+#define TSCH_RX_RSSI_NBRS 24
+#endif
+
+/* Log the RSSI of every received EB (source, channel), for range calibration */
+#ifdef TSCH_CONF_LOG_EB_RSSI
+#define TSCH_LOG_EB_RSSI TSCH_CONF_LOG_EB_RSSI
+#else /* TSCH_CONF_LOG_EB_RSSI */
+#define TSCH_LOG_EB_RSSI 0
+#endif /* TSCH_CONF_LOG_EB_RSSI */
+
+/* Log the RSSI of every received data frame too (denser range calibration) */
+#ifdef TSCH_CONF_LOG_RX_RSSI
+#define TSCH_LOG_RX_RSSI TSCH_CONF_LOG_RX_RSSI
+#else /* TSCH_CONF_LOG_RX_RSSI */
+#define TSCH_LOG_RX_RSSI 0
+#endif /* TSCH_CONF_LOG_RX_RSSI */
+
 /* Keep radio always on within TSCH timeslot (1) or turn it off between packet and ACK? (0) */
 #ifdef TSCH_CONF_RADIO_ON_DURING_TIMESLOT
 #define TSCH_RADIO_ON_DURING_TIMESLOT TSCH_CONF_RADIO_ON_DURING_TIMESLOT
