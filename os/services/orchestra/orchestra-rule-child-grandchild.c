@@ -25,85 +25,10 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+
+ NEW UPDATE MANAGED BY ANINDITA SARKAR
  */
 
-/**
- * \file
- *         Autonomous parent/child TSCH cell scheduling, WITHOUT implicit
- *         acknowledgment and WITHOUT the dual (short/regular) timeslot
- *         template -- every cell here is a completely standard TSCH cell,
- *         using the regular timeslot template and TSCH's normal,
- *         synchronous, explicit-ACK confirmation/retry logic unchanged.
- *
- *         SIZING RULE (deliberately simple): every node allocates cells with
- *         its OWN parent sized by (that node's own direct RPL child count)
- *         + 1 for its own traffic. Nothing deeper than direct children is
- *         ever tracked, estimated, or signaled -- no grandchild addresses,
- *         no per-grandchild shard counts, no RPL routing-table traversal at
- *         all. A node's own direct child is relaying an entire subtree
- *         behind it, however deep -- but from this node's point of view
- *         that is one relationship, sized once, not one relationship per
- *         descendant.
- *
- *         This replaces an earlier design (see git history/session notes)
- *         that instead estimated each relay relationship's traffic from the
- *         RPL storing-mode routing table -- a true whole-subtree traffic
- *         proxy, but one that fluctuates on every DAO/route change anywhere
- *         in a node's entire subtree. That value needed to be signaled one
- *         hop (parent needs to know a child's exact shard count to size a
- *         matching Rx cell) and changed far faster than the EB channel
- *         carrying it could keep up with at scale, and every one of a dozen
- *         different attempts to close that gap (faster signaling, larger
- *         receive-side headroom, hysteresis, dedicated slotframes, ...)
- *         made things worse, not better. Own-child-count is a far more
- *         stable quantity -- it only changes when this node's own set of
- *         direct RPL children actually changes, a comparatively rare
- *         topology event -- so the same one-hop EB signaling that failed for
- *         the old metric should be adequate for this one.
- *
- *         Every child of a given parent gets its own dedicated cell(s),
- *         HASH2(parent, child) + shard spreading, rather than sharing one
- *         position Orchestra-style -- but there is only ever one such
- *         relationship per direct child, never one per descendant.
- *
- *         The own-shard-count signal reuses the same children-list Enhanced
- *         Beacon Information Element orchestra-rule-implicit-ack.c already
- *         defines (see MLME_SHORT_IE_TSCH_IA_CHILDREN, frame802154e-ie.c),
- *         as a single entry (this node's address + one byte) in every EB,
- *         leaves included -- that byte used to carry a 0/1 has-descendants
- *         flag there, and here instead carries this node's own current
- *         shard count (see cg_get_own_children()). No framer, tsch.c, or tsch.h
- *         change was needed to support this reuse -- see this file's own
- *         TSCH_CALLBACK_IA_OWN_CHILDREN/TSCH_CALLBACK_IA_CHILD_EB
- *         definitions below.
- *
- *         Every other TSCH_CALLBACK_IA_* hook that orchestra-rule-implicit-
- *         ack.c wires up is either unneeded here (grandparent discovery,
- *         congestion-adaptive confirmation deadlines: both exist solely to
- *         support implicit-ack, which this file does not use) or must still
- *         be defined as a harmless stub purely to satisfy tsch.h's
- *         unconditional auto-wiring under TSCH_WITH_IMPLICIT_ACK=1 (needed
- *         only for the children-list IE above) -- see the "unused IA
- *         callback stubs" section near the end of this file. Critically,
- *         TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE() always returns 0 here, which
- *         by itself is sufficient to keep every other piece of the
- *         implicit-ack machinery in tsch-slot-operation.c permanently
- *         dormant regardless of TSCH_WITH_IMPLICIT_ACK's value: every one of
- *         those code paths is gated on PACKETBUF_ATTR_MAC_ACK having been
- *         left unset for a given frame, which never happens when this
- *         function always returns 0 (see send_packet(), tsch.c, and the
- *         do_wait_for_ack computation in tsch_tx_slot(),
- *         tsch-slot-operation.c). No cell installed by this file ever calls
- *         tsch_ia_link_use_short_timing() either, so every cell also keeps
- *         the regular, full-length timeslot template by construction.
- *
- *         CG_CONF_EWMA_SHARD_COUNT (default 0, off): a build-time comparison
- *         variant that replaces direct adoption of a child's EB-reported
- *         shard count with a Q8 fixed-point EWMA of it, installing the
- *         rounded average instead of the raw report -- see
- *         cg_child_eb_input()'s own comment for the mechanism and the
- *         expected trade-off this is designed to measure.
- */
 
 #include "contiki.h"
 #include "orchestra.h"
@@ -391,24 +316,7 @@
 #endif
 #endif /* CG_IDLE_RECLAIM */
 
-/* Load bonus (default 0, off): everything above only ever grows a node's
- * own shard count because its own DIRECT CHILD COUNT grew -- a node that
- * has no more children than before, but is genuinely relaying or
- * generating a lot of real traffic, has no way to ask for more than its
- * structural minimum. This adds exactly one more reason to ask for more:
- * this node's OWN recent send activity toward its OWN parent, smoothed and
- * asymmetric the same way as everything else in this file.
- *
- * Deliberately scoped to be safe against the exact failure this whole
- * design replaced (see the file's own header comment and "Root Cause" in
- * the companion paper): that failure came from signaling a WHOLE-SUBTREE
- * aggregate, whose rate of change grows with subtree size and therefore
- * with network scale. What is measured here is only this one node's own
- * local send activity -- bounded by how much traffic THIS node personally
- * has, never by how large its subtree is or how the network happens to be
- * sized. It rides the identical one-hop EB channel and the identical
- * shard-count field everything else here already uses; nothing new is
- * added to the wire. */
+
 #ifndef CG_CONF_LOAD_BONUS
 #define CG_LOAD_BONUS 0
 #else
@@ -416,22 +324,7 @@
 #endif
 
 #if CG_LOAD_BONUS
-/* How X_S is decided. Queue-based (default under CG_DYNAMIC_KMAX): no
- * traffic-rate threshold at all. Once per slotframe -- the time in which
- * every one of this node's installed uplink cells comes round exactly once,
- * so at most that many packets can leave per sample -- we compare the
- * number of packets queued to our parent with that cell count. If more
- * packets are waiting than one round of our cells can carry, at two
- * samples in a row, the backlog is not draining: our cells are not
- * enough, at whatever rate traffic happens to arrive, so X_S = 1 is
- * granted immediately. A single packet that is merely retrying after a
- * collision or a lost ACK never counts -- that is a loss, not a lack of
- * cells, and an extra cell would not fix it. X_S is released
- * only after CG_LOAD_RELEASE_WINDOWS consecutive CG_LOAD_CHECK_PERIOD
- * windows without any such shortage (rise fast, fall slow). Rate-based
- * (the fixed-cap builds, unchanged): an EWMA of packets per window
- * compared against the fixed CG_LOAD_BUSY_THRESHOLD, which is only
- * meaningful for the one send rate it was tuned for. */
+
 #ifdef CG_CONF_LOAD_QUEUE_BASED
 #define CG_LOAD_QUEUE_BASED CG_CONF_LOAD_QUEUE_BASED
 #else
@@ -439,10 +332,7 @@
 #endif
 
 #if CG_LOAD_QUEUE_BASED
-/* Quiet windows (of CG_LOAD_CHECK_PERIOD each) before X_S is released:
- * 5 x 60 s. A hysteresis time, not a traffic threshold -- it keeps a node
- * that needs its extra cell under steady load from dropping it the moment
- * that cell has cleared its queue. */
+
 #ifndef CG_CONF_LOAD_RELEASE_WINDOWS
 #define CG_LOAD_RELEASE_WINDOWS 5
 #else
