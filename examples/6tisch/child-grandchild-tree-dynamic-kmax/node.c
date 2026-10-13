@@ -27,46 +27,7 @@
  * SUCH DAMAGE.
  *
  */
-/**
- * \file
- *         Smoke-test node for the autonomous implicit-ack tree scheduler
- *         (os/services/orchestra/orchestra-rule-implicit-ack.c), extended
- *         with hop-by-hop in-network aggregation of the application traffic
- *         itself.
- *
- *         Motivation: RELAY_TX shards (see orchestra-rule-implicit-ack.c)
- *         give any one parent-child relationship at most a fixed, small
- *         multiplier (ORCHESTRA_IA_RELAY_TX_SHARDS) of extra capacity. Near
- *         the root, traffic fans in from an entire subtree, and subtree size
- *         grows with network size -- so past some scale, some node's
- *         aggregate arrival rate exceeds what any fixed multiplier can
- *         drain, and packets are dropped at the TSCH queue (tsch_queue_add_
- *         packet() failing outright, "can't send packet ... queue 128/128"),
- *         not at the radio. Adding more parallel cells cannot fix this in
- *         general; the fix here instead reduces how many separate
- *         transmissions are needed to move the same amount of application
- *         data, by combining multiple nodes' tiny reports into one frame per
- *         hop instead of relaying each one individually.
- *
- *         Every non-root node still originates its own periodic report
- *         exactly as before, but instead of addressing it directly to the
- *         root (which stock 6LoWPAN/RPL would then transparently forward,
- *         hop by hop, entirely below the application), it now always
- *         addresses its own current aggregate to its own immediate RPL
- *         parent, and every node -- not just the root -- terminates and
- *         inspects the UDP payload it receives: it unpacks whatever reports
- *         a child just relayed, folds them into its own outgoing aggregate
- *         buffer alongside its own report, and periodically flushes that
- *         combined buffer as a single packet to its own parent. The root is
- *         simply the node for which "next hop" has no further hop: it
- *         unpacks and logs each item instead of forwarding it onward. This
- *         only ever changes application-layer packet counts and payload
- *         sizes -- it does not touch ROOT_ADJACENT, UPLINK, RELAY_TX,
- *         SELF_OVERHEAR, or the implicit-ack confirmation mechanism, all of
- *         which keep operating exactly as before on whatever the
- *         application now hands them.
- *
- */
+
 
 #include "contiki.h"
 #include "sys/node-id.h"
@@ -106,15 +67,7 @@
 #define NODE_IS_ROOT 0
 #endif
 
-/* Testbed telemetry (hardware default; Cooja keeps the original 3-byte items
- * and log lines). On hardware node_id is 16-bit, so an item carries a 16-bit
- * origin (the 8-bit one would alias boards, e.g. 0xdebc and 0x63bc), plus the
- * low 16 bits of the ASN at which the origin generated it, for end-to-end
- * latency at the root (unwrapped there against the reception ASN; valid for
- * latencies under 2^16 slots). The root logs one ATAS-RX line per item and an
- * ATAS-CLK (ASN, time) sample every second; every node also sends an
- * ATAS-STAT report (RDC counters, rank, parent) straight to the root every
- * STATS_INTERVAL on STATS_PORT. Parse the root's log with hw/analyze.py. */
+
 #ifdef ATAS_CONF_TELEMETRY
 #define ATAS_TELEMETRY ATAS_CONF_TELEMETRY
 #else
@@ -128,35 +81,7 @@
 #define ITEM_WIRE 3  /* origin(1) seq(2) */
 #endif
 
-/* Aggregation parameters. Each item is (origin node id, origin's own
- * sequence number): 1 + 2 = 3 bytes on the wire. AGG_FLUSH_INTERVAL trades
- * added latency (how long an item may sit in an intermediate node's buffer
- * before being forwarded) against how many items typically get bundled into
- * one outgoing frame.
- *
- * MAX_AGG_ITEMS was originally set to 16 (49 wire bytes) purely to stay
- * comfortably clear of one 802.15.4 frame's usable payload after 6LoWPAN/
- * IPv6/UDP compression overhead. Measurement at 100/150 nodes showed that
- * value was actually far too conservative for a different reason entirely:
- * "IATRACE agg overflow-drop" (add_item()'s forced drop-oldest fallback,
- * originally meant only for the rare bootstrap case of no route yet) was
- * firing thousands of times over a single run -- 6357 times at 100 nodes --
- * driven by "IATRACE agg defer-global" (the node-wide TSCH packet pool
- * being full) firing *8071* times, meaning the underlying congestion
- * routinely outlasted a 16-item buffer's capacity to simply wait it out.
- * Raising this to 24 (73 wire bytes, confirmed fragmentation-free) let
- * PDR nearly double at 100 nodes (20.2%->39.4%) and more than double at 150
- * (10.5%->23.2%), simply by giving pending items more headroom to survive a
- * sustained congestion episode without being dropped. 32 (97 wire bytes)
- * was also tried and made things much worse (150 nodes: 23.2%->8.4%): it
- * crosses the actual single-frame payload budget once 6LoWPAN/IPv6/UDP
- * headers are added, confirmed by 6LoWPAN fragmentation appearing in the
- * log (1071 occurrences, versus zero at 24) -- a fragmented aggregate needs
- * every fragment to arrive for the whole batch to reassemble, turning one
- * lost frame into a lost aggregate instead of one lost item. 24 is the
- * validated sweet spot: as large as tested without crossing into
- * fragmentation, and already a large, measured win over the original,
- * overly-conservative value. */
+
 #define AGG_FLUSH_INTERVAL (5 * CLOCK_SECOND)
 #if ATAS_TELEMETRY
 /* 6-byte items: 12 keeps the same 73-byte, fragmentation-free frame */
@@ -166,19 +91,7 @@
 #endif
 #define AGG_WIRE_MAX (1 + MAX_AGG_ITEMS * ITEM_WIRE)
 
-/* EWMA-predicted congestion toward our own parent, in percent occupancy of
- * that neighbor's TSCH queue (0..100). A raw, instantaneous occupancy check
- * only ever tells us "full right now" -- by the time that is true, a send
- * attempt is essentially guaranteed to be wasted or, worse, contend for the
- * one slot that frees up right as some other node's packet also arrives.
- * Smoothing it into an EWMA instead answers a different, more useful
- * question -- "has this link been *trending* congested over the last
- * several flush cycles" -- which is what we actually want in order to
- * decide how much to risk bundling into a single frame *before* the queue
- * is already full, not just react once it is. EWMA_SHIFT=3 gives new
- * samples 1/8 weight (~8 flush cycles, ~40s, to mostly settle to a new
- * steady state) -- smooth enough to ignore one-off blips, responsive enough
- * to track a real, sustained shift within well under a minute. */
+
 #define EWMA_SHIFT 3
 #define CONGESTION_HIGH_PCT 50
 #define CONGESTION_SMALL_CAP 4
