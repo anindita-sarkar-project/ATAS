@@ -17,7 +17,7 @@ APAS combines four mechanisms:
 
 | Mechanism | What it does |
 |---|---|
-| **Structural floor** (`K_S = min(m_S + 1+ X_S)`) | Grants a node cells the instant a child joins, sized by its direct child count, before that child ever transmits. |
+| **Structural floor** (`K_S = m_P + 1+ X_P`) | Grants a node cells the instant a child joins, sized by its direct child count, before that child ever transmits. |
 | **Asymmetric load estimation** | Lets a genuinely busy node earn one extra cell from its own recent traffic, using a fast-rise/slow-fall EWMA so a single busy window doesn't cost a still-needed cell later. |
 | **Idle reclaim** | Shrinks a child's cells back to its guaranteed minimum after sustained silence, freeing capacity for other nodes without waiting for RPL to remove it. |
 
