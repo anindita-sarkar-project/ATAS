@@ -25,10 +25,85 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
-
- NEW UPDATE MANAGED BY ANINDITA SARKAR
  */
 
+/**
+ * \file
+ *         Autonomous parent/child TSCH cell scheduling, WITHOUT implicit
+ *         acknowledgment and WITHOUT the dual (short/regular) timeslot
+ *         template -- every cell here is a completely standard TSCH cell,
+ *         using the regular timeslot template and TSCH's normal,
+ *         synchronous, explicit-ACK confirmation/retry logic unchanged.
+ *
+ *         SIZING RULE (deliberately simple): every node allocates cells with
+ *         its OWN parent sized by (that node's own direct RPL child count)
+ *         + 1 for its own traffic. Nothing deeper than direct children is
+ *         ever tracked, estimated, or signaled -- no grandchild addresses,
+ *         no per-grandchild shard counts, no RPL routing-table traversal at
+ *         all. A node's own direct child is relaying an entire subtree
+ *         behind it, however deep -- but from this node's point of view
+ *         that is one relationship, sized once, not one relationship per
+ *         descendant.
+ *
+ *         This replaces an earlier design (see git history/session notes)
+ *         that instead estimated each relay relationship's traffic from the
+ *         RPL storing-mode routing table -- a true whole-subtree traffic
+ *         proxy, but one that fluctuates on every DAO/route change anywhere
+ *         in a node's entire subtree. That value needed to be signaled one
+ *         hop (parent needs to know a child's exact shard count to size a
+ *         matching Rx cell) and changed far faster than the EB channel
+ *         carrying it could keep up with at scale, and every one of a dozen
+ *         different attempts to close that gap (faster signaling, larger
+ *         receive-side headroom, hysteresis, dedicated slotframes, ...)
+ *         made things worse, not better. Own-child-count is a far more
+ *         stable quantity -- it only changes when this node's own set of
+ *         direct RPL children actually changes, a comparatively rare
+ *         topology event -- so the same one-hop EB signaling that failed for
+ *         the old metric should be adequate for this one.
+ *
+ *         Every child of a given parent gets its own dedicated cell(s),
+ *         HASH2(parent, child) + shard spreading, rather than sharing one
+ *         position Orchestra-style -- but there is only ever one such
+ *         relationship per direct child, never one per descendant.
+ *
+ *         The own-shard-count signal reuses the same children-list Enhanced
+ *         Beacon Information Element orchestra-rule-implicit-ack.c already
+ *         defines (see MLME_SHORT_IE_TSCH_IA_CHILDREN, frame802154e-ie.c),
+ *         as a single entry (this node's address + one byte) in every EB,
+ *         leaves included -- that byte used to carry a 0/1 has-descendants
+ *         flag there, and here instead carries this node's own current
+ *         shard count (see cg_get_own_children()). No framer, tsch.c, or tsch.h
+ *         change was needed to support this reuse -- see this file's own
+ *         TSCH_CALLBACK_IA_OWN_CHILDREN/TSCH_CALLBACK_IA_CHILD_EB
+ *         definitions below.
+ *
+ *         Every other TSCH_CALLBACK_IA_* hook that orchestra-rule-implicit-
+ *         ack.c wires up is either unneeded here (grandparent discovery,
+ *         congestion-adaptive confirmation deadlines: both exist solely to
+ *         support implicit-ack, which this file does not use) or must still
+ *         be defined as a harmless stub purely to satisfy tsch.h's
+ *         unconditional auto-wiring under TSCH_WITH_IMPLICIT_ACK=1 (needed
+ *         only for the children-list IE above) -- see the "unused IA
+ *         callback stubs" section near the end of this file. Critically,
+ *         TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE() always returns 0 here, which
+ *         by itself is sufficient to keep every other piece of the
+ *         implicit-ack machinery in tsch-slot-operation.c permanently
+ *         dormant regardless of TSCH_WITH_IMPLICIT_ACK's value: every one of
+ *         those code paths is gated on PACKETBUF_ATTR_MAC_ACK having been
+ *         left unset for a given frame, which never happens when this
+ *         function always returns 0 (see send_packet(), tsch.c, and the
+ *         do_wait_for_ack computation in tsch_tx_slot(),
+ *         tsch-slot-operation.c). No cell installed by this file ever calls
+ *         tsch_ia_link_use_short_timing() either, so every cell also keeps
+ *         the regular, full-length timeslot template by construction.
+ *
+ *         CG_CONF_EWMA_SHARD_COUNT (default 0, off): a build-time comparison
+ *         variant that replaces direct adoption of a child's EB-reported
+ *         shard count with a Q8 fixed-point EWMA of it, installing the
+ *         rounded average instead of the raw report -- see
+ *         cg_child_eb_input()'s own comment for the mechanism and the
+ *         expected trade-off this is designed to measure.
+ */
 
 #include "contiki.h"
 #include "orchestra.h"
@@ -53,12 +128,11 @@
  * a child attaches (child_added(), zero traffic observed) rather than only
  * after that child's traffic has been observed and estimated. Setting this
  * to 0 is an ABLATION BUILD, not a real deployment option: with it off, the
- * child-count loop below is skipped entirely, and this node's shard count
- * comes only from CG_LOAD_BONUS (traffic actually observed) exactly as a
- * purely reactive scheme like A3 would size it -- everything else in this
- * file (idle reclaim, rank cap, hold-before-use) is untouched, so this
- * isolates the one variable the structural-provisioning claim depends on
- * for a controlled comparison (full APAS vs. APAS-without-structural). */
+ * child-count loop below is skipped entirely, and every node uses a single
+ * cell toward its parent -- everything else in this file (idle reclaim,
+ * hold-before-use) is untouched, so this isolates the one variable the
+ * structural-provisioning claim depends on for a controlled comparison
+ * (full APAS vs. APAS-without-structural). */
 #ifndef CG_CONF_STRUCTURAL_PROVISIONING
 #define CG_STRUCTURAL_PROVISIONING 1
 #else
@@ -257,27 +331,24 @@
 #define CG_EWMA_SHARD_COUNT CG_CONF_EWMA_SHARD_COUNT
 #endif
 
-/* Idle reclaim (default 0, off): the mechanisms above all react to what a
- * child SAYS about itself in its EB (its own structural child count). This
- * one instead watches whether the parent has actually HEARD anything from a
- * child recently, and if not for a long time, shrinks that child's cells
- * back down to the guaranteed minimum of 1 -- freeing the rest for other
- * children -- without waiting for RPL to decide the child is gone
- * (child_removed() keeps working exactly as before, independently; this is
- * a faster, additional, and reversible reaction to silence, not a
- * replacement for RPL's own removal).
+/* Idle reclaim (default 0, off): a node that has sent no application data
+ * to its parent for several minutes moves to the shared cell. The node
+ * decides this itself, because only it knows whether it has anything to
+ * send: it keeps an idle score (1 = sent data recently), folded every
+ * CG_IDLE_CHECK_PERIOD (decay to 3/4 per silent check), and once the score
+ * drops below CG_IDLE_RECLAIM_THRESHOLD it sets K_S = 0. It then removes its
+ * own uplink cells at once -- select_packet() finds none and leaves its
+ * frames to the next rule, the shared cell of default_common, which its
+ * parent always listens on -- and announces K_S = 0 in its next EB, on which
+ * the parent removes every receive cell it kept for it. Shrinking in this
+ * order (child first, parent after the EB) never leaves the child sending in
+ * a cell its parent has stopped listening on.
  *
- * Deliberately does NOT touch the child's own uplink behavior: the child
- * still transmits on however many shards ITS OWN child count says it needs,
- * unaware the parent shrank its Rx side. A reclaimed child is then held at
- * 1 shard even though its EBs keep advertising more (it still beacons while
- * idle -- adopting those EBs would undo the reclaim within one EB period);
- * the moment it sends real data again, cg_data_input() restores the count
- * its EBs advertise. Its shard 0 is always kept, so that first data frame
- * does get through; frames it sent on its other shards before the restore
- * are retried on its next cell. CG_IDLE_CHECK_PERIOD and the EWMA
- * decay shift below are chosen so this only fires after several minutes of
- * true silence, not a single missed application-layer send. */
+ * The moment the node queues application data for its parent again, it is
+ * active: K_S goes back to k + 1, and CG_HOLD_BEFORE_USE keeps it on the
+ * shared cell until an EB has stated the new count, after which both ends
+ * install the same cells. Keepalives and RPL control never count as
+ * activity (see cg_frame_is_app_data()). */
 #ifndef CG_CONF_IDLE_RECLAIM
 #define CG_IDLE_RECLAIM 0
 #else
@@ -316,76 +387,6 @@
 #endif
 #endif /* CG_IDLE_RECLAIM */
 
-
-#ifndef CG_CONF_LOAD_BONUS
-#define CG_LOAD_BONUS 0
-#else
-#define CG_LOAD_BONUS CG_CONF_LOAD_BONUS
-#endif
-
-#if CG_LOAD_BONUS
-
-#ifdef CG_CONF_LOAD_QUEUE_BASED
-#define CG_LOAD_QUEUE_BASED CG_CONF_LOAD_QUEUE_BASED
-#else
-#define CG_LOAD_QUEUE_BASED CG_DYNAMIC_KMAX
-#endif
-
-#if CG_LOAD_QUEUE_BASED
-
-#ifndef CG_CONF_LOAD_RELEASE_WINDOWS
-#define CG_LOAD_RELEASE_WINDOWS 5
-#else
-#define CG_LOAD_RELEASE_WINDOWS CG_CONF_LOAD_RELEASE_WINDOWS
-#endif
-#endif /* CG_LOAD_QUEUE_BASED */
-
-/* Queue-based: the release window. Rate-based: how often we fold "how much
- * did I send this window" into the load EWMA. */
-#ifndef CG_CONF_LOAD_CHECK_PERIOD
-#define CG_LOAD_CHECK_PERIOD (CLOCK_SECOND * 60)
-#else
-#define CG_LOAD_CHECK_PERIOD CG_CONF_LOAD_CHECK_PERIOD
-#endif
-
-/* A node that sends this many (or more) of its own packets toward its
- * parent within one check window counts as "fully busy" (sample = 256/256)
- * for that window; fewer sends scale down proportionally, 0 sends = 0. */
-#ifndef CG_CONF_LOAD_SATURATE_COUNT
-#define CG_LOAD_SATURATE_COUNT 4
-#else
-#define CG_LOAD_SATURATE_COUNT CG_CONF_LOAD_SATURATE_COUNT
-#endif
-
-/* Asymmetric like everything else here, but tuned differently on purpose:
- * genuine, sustained demand should earn its extra shard reasonably fast
- * (attack shift 1, weight 1/2 per window) -- unlike the shard-count EWMA's
- * instant attack, this is not a correctness-critical direction (a node
- * without its bonus yet simply keeps using its structural minimum, exactly
- * as it always has -- no cell is lost, only a possible extra one is
- * delayed), so a little averaging first is cheap insurance against a
- * single busy window granting a shard that is not really needed. Losing
- * the bonus decays much slower still (shift 3, weight 1/8), so one quiet
- * window does not immediately give back capacity a node is still using
- * most of the time. */
-#ifndef CG_CONF_LOAD_EWMA_ATTACK_SHIFT
-#define CG_LOAD_EWMA_ATTACK_SHIFT 1
-#else
-#define CG_LOAD_EWMA_ATTACK_SHIFT CG_CONF_LOAD_EWMA_ATTACK_SHIFT
-#endif
-
-#ifndef CG_CONF_LOAD_EWMA_DECAY_SHIFT
-#define CG_LOAD_EWMA_DECAY_SHIFT 3
-#else
-#define CG_LOAD_EWMA_DECAY_SHIFT CG_CONF_LOAD_EWMA_DECAY_SHIFT
-#endif
-
-#ifndef CG_CONF_LOAD_BUSY_THRESHOLD
-#define CG_LOAD_BUSY_THRESHOLD 160 /* out of 256 (Q8): ~63% of saturate-count, sustained */
-#else
-#define CG_LOAD_BUSY_THRESHOLD CG_CONF_LOAD_BUSY_THRESHOLD
-#endif
-#endif /* CG_LOAD_BONUS */
 
 /* Hold-before-use (default 0, off): closes the one remaining gap between
  * this design and the original proposal it started from. Everywhere
@@ -472,18 +473,9 @@ struct cg_child {
   uint16_t shard_ewma_q8;
 #endif
 #if CG_IDLE_RECLAIM
-  /* Set by cg_data_input() the moment real data is heard from this child;
-   * cleared by idle_tick() every CG_IDLE_CHECK_PERIOD once it has been
-   * folded into idle_ewma_q8 below. */
-  uint8_t heard_since_check;
-  /* Q8 fixed-point recent-activity estimate, 256 = just heard from it,
-   * decaying toward 0 under sustained silence (see idle_tick()). */
-  uint16_t idle_ewma_q8;
-  /* Set when idle_tick() reclaimed this child: its cells stay at 1, even
-   * though its EBs keep advertising more, until it sends real data again
-   * (cg_data_input()). advertised holds what its EBs say meanwhile. */
-  uint8_t reclaimed;
-  uint8_t advertised;
+  /* Set while this child's EBs announce K = 0 (it is idle and uses the
+   * shared cell): no receive cell is kept for it. */
+  uint8_t idle;
 #endif
   /* Lists of struct cg_cell, shard k at list position k (see
    * cg_set_cells()). */
@@ -510,26 +502,13 @@ LIST(l_root_adjacent);
 
 static struct cg_child children[CG_MAX_CHILDREN];
 
-#if CG_LOAD_BONUS
-/* Node-wide, not per-child: this is about THIS node's own outgoing traffic
- * toward its OWN parent, not anything about any specific child. Counted in
- * select_packet() every time a real data frame for our parent is matched
- * to one of our own cells; folded into own_load_ewma_q8 and, if that
- * estimate is sustained above CG_LOAD_BUSY_THRESHOLD, own_load_bonus is set
- * to 1 and cg_own_shard_count() adds it on top of the structural count. */
-static uint8_t own_load_bonus;
-#if CG_LOAD_QUEUE_BASED
-/* Whether the previous per-slotframe sample already found more packets
- * queued to our parent than we have uplink cells. */
-static uint8_t last_backlogged;
-/* Set by queue_tick() when a head packet survived a full slotframe;
- * cleared every CG_LOAD_CHECK_PERIOD by load_tick(). */
-static uint8_t shortage_seen;
-static uint8_t quiet_windows;
-#else
-static uint16_t own_load_tx_count;
-static uint16_t own_load_ewma_q8;
-#endif
+#if CG_IDLE_RECLAIM
+/* This node's own idle state toward its parent (see CG_IDLE_RECLAIM). */
+static uint8_t own_heard;          /* sent application data since the last check */
+static uint16_t own_idle_q8 = 1 << 8;
+static uint8_t own_idle;           /* K_S = 0: using the shared cell */
+static struct ctimer idle_timer;
+static struct ctimer wake_timer;   /* re-sizes our cells outside select_packet() */
 #endif
 
 #if CG_HOLD_BEFORE_USE
@@ -630,8 +609,7 @@ cg_effective_cap(void)
  * Under the CG_STRUCTURAL_PROVISIONING=0 ablation build, the child-count
  * loop is skipped: n starts at 1 (own traffic only) regardless of how many
  * children this node actually has, so a newly-attached child earns this
- * relay no additional uplink capacity until CG_LOAD_BONUS's own traffic
- * observation later grants it -- the reactive-only comparison point. */
+ * relay no additional uplink capacity at all. */
 #if CG_ABLATION_SUBTREE_COUNT
 /* Ablation: nodes below this one, sum over direct children of (1 + d_c). */
 static uint8_t
@@ -668,8 +646,10 @@ cg_own_shard_count(void)
 #endif
 #endif
   n++; /* +1 for this node's own traffic */
-#if CG_LOAD_BONUS
-  n += own_load_bonus; /* +1 more if sustained real load earned it (load_tick()) */
+#if CG_IDLE_RECLAIM
+  if(own_idle) {
+    return 0; /* idle: no dedicated cell, the shared cell carries our frames */
+  }
 #endif
 #if CG_RANK_CAP && !CG_DYNAMIC_KMAX
   cap = cg_effective_cap();
@@ -791,14 +771,7 @@ alloc_child(const linkaddr_t *addr)
       children[i].shard_ewma_q8 = 1 << 8; /* matches the shard_count=1 bootstrap default below */
 #endif
 #if CG_IDLE_RECLAIM
-      /* Start "fully active": a just-joined child gets the same grace
-       * period every other bootstrap default in this file already gives
-       * it, rather than becoming reclaim-eligible before it has ever had a
-       * chance to send anything. */
-      children[i].heard_since_check = 1;
-      children[i].idle_ewma_q8 = 1 << 8;
-      children[i].reclaimed = 0;
-      children[i].advertised = 0;
+      children[i].idle = 0;
 #endif
       LIST_STRUCT_INIT(&children[i], relay_rx);
       LIST_STRUCT_INIT(&children[i], root_adjacent_rx);
@@ -893,6 +866,11 @@ static void
 update_child_relay_rx(struct cg_child *c)
 {
   uint8_t want_shards = c->shard_count > 0 ? c->shard_count : 1;
+#if CG_IDLE_RECLAIM
+  if(c->idle) {
+    want_shards = 0;
+  }
+#endif
   if(sf_short == NULL) {
     return;
   }
@@ -909,6 +887,11 @@ static void
 update_child_root_adjacent_rx(struct cg_child *c)
 {
   uint8_t want_shards = c->shard_count > 0 ? c->shard_count : 1;
+#if CG_IDLE_RECLAIM
+  if(c->idle) {
+    want_shards = 0;
+  }
+#endif
   if(sf_root == NULL || !tsch_is_coordinator) {
     cg_clear_cells(sf_root, c->root_adjacent_rx);
     return;
@@ -971,17 +954,35 @@ bootstrap_tick(void *ptr)
   ctimer_set(&bootstrap_timer, CG_BOOTSTRAP_CHECK_PERIOD, bootstrap_tick, NULL);
 }
 /*---------------------------------------------------------------------------*/
-/* Adopts shard count v that child c advertised in its EB -- unless c was
- * reclaimed for being idle, in which case it stays at 1 until it sends
- * real data again. Without that hold, c's very next EB (~15 s later) would
- * restore every reclaimed cell while c is still silent. */
+/* Adopts shard count v that child c advertised in its EB. Under
+ * CG_IDLE_RECLAIM, v = 0 means c is idle and uses the shared cell: every
+ * receive cell kept for it is removed until it announces a count again. */
 static void
 cg_adopt_child_count(struct cg_child *c, uint8_t v)
 {
 #if CG_IDLE_RECLAIM
-  c->advertised = v;
-  if(c->reclaimed) {
+  if(v == 0) {
+    if(!c->idle) {
+      LOG_INFO("cg: reclaiming idle child's shards (was %u) -- ", c->shard_count > 0 ? c->shard_count : 1);
+      LOG_INFO_LLADDR(&c->addr);
+      LOG_INFO_("\n");
+      c->idle = 1;
+      update_child(c);
+    }
     return;
+  }
+  if(c->idle) {
+    c->idle = 0;
+    c->shard_count = v;
+    LOG_INFO("cg: child active again, restoring %u shards -- ", v);
+    LOG_INFO_LLADDR(&c->addr);
+    LOG_INFO_("\n");
+    update_child(c);
+    return;
+  }
+#else
+  if(v == 0) {
+    v = 1;
   }
 #endif
   if(c->shard_count != v) {
@@ -991,24 +992,6 @@ cg_adopt_child_count(struct cg_child *c, uint8_t v)
 }
 /*---------------------------------------------------------------------------*/
 #if CG_IDLE_RECLAIM
-static struct ctimer idle_timer;
-/* TSCH_CALLBACK_UNICAST_DATA_INPUT: fires from tsch_rx_process_pending() for
- * every incoming DATA-type frame, right after its payload has been copied
- * into packetbuf and before it is passed up to packet_input(). We reuse it
- * as a "heard REAL traffic from src" tap for idle_tick() below.
- *
- * We originally tapped TSCH_CALLBACK_DO_NACK for this instead (fires
- * earlier, on any ack-required reception) and found by live-testing this
- * exact mechanism that it never actually detected a genuinely idle child:
- * TSCH's own keepalive frames are ordinary, ack-required, empty-payload
- * DATA frames sent specifically BECAUSE a node has had nothing real to
- * send for a while -- so a truly idle child, from the application's point
- * of view, looks maximally *active* to a tap that cannot see payload
- * length. TSCH_CALLBACK_UNICAST_DATA_INPUT fires after packetbuf is
- * populated, so the frame can be inspected -- but packetbuf then holds the
- * raw frame, MAC header included, so packetbuf_datalen() alone is never 0
- * (an earlier version relied on that and counted every keepalive as
- * activity); see cg_frame_is_app_data(). */
 /* Whether the frame in packetbuf carries application data (UDP), as
  * opposed to an empty keepalive or RPL control traffic (ICMPv6 DAO/DIO/DIS/
  * probes), which a node keeps sending to its parent while it has nothing
@@ -1019,13 +1002,13 @@ static struct ctimer idle_timer;
  * ICMPv6. */
 #if !CG_ABLATION_ANY_FRAME_ACTIVITY
 static int
-cg_frame_is_app_data(void)
+cg_frame_is_app_data(const uint8_t *buf, int buflen)
 {
   frame802154_t frame;
   const uint8_t *p;
   int len;
 
-  if(frame802154_parse(packetbuf_dataptr(), packetbuf_datalen(), &frame) == 0) {
+  if(frame802154_parse((uint8_t *)buf, buflen, &frame) == 0) {
     return 0;
   }
   p = frame.payload;
@@ -1045,178 +1028,65 @@ cg_frame_is_app_data(void)
   return (p[0] & 0xe0) == 0x60 && (p[0] & 0x04) != 0; /* IPHC with NH=1 */
 }
 #endif /* !CG_ABLATION_ANY_FRAME_ACTIVITY */
-/*---------------------------------------------------------------------------*/
-void
-cg_data_input(const linkaddr_t *source)
+/* Whether the outgoing frame in packetbuf counts as activity toward our
+ * parent: application data only (any data frame in the ablation build). */
+static int
+cg_is_activity(void)
 {
-  struct cg_child *c;
 #if CG_ABLATION_ANY_FRAME_ACTIVITY
-  if(packetbuf_datalen() == 0) {
-    return; /* never true on the raw frame -- every frame counts (ablation) */
-  }
+  return 1;
 #else
-  if(!cg_frame_is_app_data()) {
-    return; /* keepalive or RPL control -- not evidence of real activity */
-  }
+  /* Outgoing packet, already framed (select_packet() runs from
+   * tsch_queue_add_packet(), after NETSTACK_FRAMER.create()): the MAC header
+   * sits in front of the payload, at packetbuf_hdrptr(). */
+  return cg_frame_is_app_data(packetbuf_hdrptr(), packetbuf_totlen());
 #endif
-  c = find_child(source);
-  if(c != NULL) {
-    c->heard_since_check = 1;
-    if(c->reclaimed) {
-      /* Active again: give back what it advertises. */
-      c->reclaimed = 0;
-      LOG_INFO("cg: child active again, restoring %u shards -- ", c->advertised);
-      LOG_INFO_LLADDR(&c->addr);
-      LOG_INFO_("\n");
-      cg_adopt_child_count(c, c->advertised > 0 ? c->advertised : 1);
-    }
-  }
 }
 /*---------------------------------------------------------------------------*/
-/* Every CG_IDLE_CHECK_PERIOD, for every tracked child: fold whether we
- * heard from it this period into idle_ewma_q8 (fast up on real activity,
- * slow decay under silence -- see the constant block's own comment), and
- * if that estimate has dropped below CG_IDLE_RECLAIM_THRESHOLD, shrink the
- * child back to its guaranteed-minimum 1 shard, freeing the rest. Never
- * removes the child outright -- that stays RPL's decision via
- * child_removed() -- and never shrinks a child already at 1. */
+static void
+wake_cb(void *ptr)
+{
+  update_uplink();
+  update_root_adjacent();
+}
+/*---------------------------------------------------------------------------*/
+/* Every CG_IDLE_CHECK_PERIOD: fold whether we sent application data to our
+ * parent this period into own_idle_q8 (back to 1 at once on data, 3/4 per
+ * silent check), and move to the shared cell (K_S = 0) once it is below
+ * CG_IDLE_RECLAIM_THRESHOLD. Also logs, per child, the receive cells kept
+ * for it (0 while it is idle). */
 static void
 idle_tick(void *ptr)
 {
   int i;
+  if(own_heard) {
+    own_idle_q8 = 1 << 8;
+  } else {
+    own_idle_q8 -= own_idle_q8 >> CG_IDLE_EWMA_DECAY_SHIFT;
+  }
+  own_heard = 0;
+  LOG_INFO("cg: own idle score=%u/256 idle=%u\n", own_idle_q8, own_idle);
+  if(!own_idle && own_idle_q8 < CG_IDLE_RECLAIM_THRESHOLD
+     && !linkaddr_cmp(&orchestra_parent_linkaddr, &linkaddr_null)) {
+    own_idle = 1;
+    LOG_INFO("cg: idle, moving to the shared cell (K_S=0)\n");
+    update_uplink();
+    update_root_adjacent();
+  }
   for(i = 0; i < CG_MAX_CHILDREN; i++) {
     struct cg_child *c = &children[i];
-    uint16_t sample_q8;
     if(!c->in_use) {
       continue;
     }
-    sample_q8 = c->heard_since_check ? (1 << 8) : 0;
-    if(sample_q8 >= c->idle_ewma_q8) {
-      c->idle_ewma_q8 = sample_q8; /* attack: instant */
-    } else {
-      c->idle_ewma_q8 += (int32_t)(sample_q8 - c->idle_ewma_q8) >> CG_IDLE_EWMA_DECAY_SHIFT;
-    }
-    c->heard_since_check = 0;
-    LOG_INFO("cg: idle_tick DIAG child shard_count=%u ewma=%u/256 -- ", c->shard_count, c->idle_ewma_q8);
+    LOG_INFO("cg: idle_tick DIAG child shard_count=%u ewma=%u/256 -- ",
+             c->idle ? 0 : (c->shard_count > 0 ? c->shard_count : 1), c->idle ? 0 : 256);
     LOG_INFO_LLADDR(&c->addr);
     LOG_INFO_("\n");
-    if(c->idle_ewma_q8 < CG_IDLE_RECLAIM_THRESHOLD && c->shard_count > 1) {
-      LOG_INFO("cg: reclaiming idle child's shards (was %u) -- ", c->shard_count);
-      LOG_INFO_LLADDR(&c->addr);
-      LOG_INFO_("\n");
-      c->shard_count = 1;
-      c->reclaimed = 1;
-      update_child(c);
-    }
   }
   ctimer_set(&idle_timer, CG_IDLE_CHECK_PERIOD, idle_tick, NULL);
 }
 #endif /* CG_IDLE_RECLAIM */
 /*---------------------------------------------------------------------------*/
-#if CG_LOAD_BONUS
-static struct ctimer load_timer;
-#if CG_LOAD_QUEUE_BASED
-static struct ctimer queue_timer;
-/* One slotframe of whichever slotframe our uplink cells are in, in clock
- * ticks (rounded up): the time for all K_S of our cells to pass once. */
-static clock_time_t
-cg_slotframe_ticks(void)
-{
-  uint16_t len = tsch_roots_is_root(&orchestra_parent_linkaddr) ? CG_ROOT_PERIOD : TSCH_IA_SFS_SIZE;
-  uint32_t us = (uint32_t)len * RTIMERTICKS_TO_US(tsch_timing[tsch_ts_timeslot_length]);
-  clock_time_t t = (clock_time_t)(((uint64_t)us * CLOCK_SECOND + 999999) / 1000000);
-  return t > 0 ? t : 1; /* never a zero-period (busy-looping) timer */
-}
-/*---------------------------------------------------------------------------*/
-/* Every slotframe: shortage if more packets are queued to our parent than
- * our installed uplink cells can send in one slotframe, at this sample and
- * the previous one. Only sampled while our uplink cells are installed --
- * before that, packets wait for a missing cell, not for more cells.
- * Grants X_S immediately (fast rise). */
-static void
-queue_tick(void *ptr)
-{
-  int cells = list_length(tsch_roots_is_root(&orchestra_parent_linkaddr) ? l_root_adjacent : l_uplink);
-  int queued = 0;
-  uint8_t backlogged;
-
-  if(orchestra_parent_knows_us && cells > 0) {
-    struct tsch_neighbor *n = tsch_queue_get_nbr(&orchestra_parent_linkaddr);
-    if(n != NULL) {
-      queued = tsch_queue_nbr_packet_count(n);
-    }
-  }
-  backlogged = cells > 0 && queued > cells;
-  if(backlogged && last_backlogged) {
-    shortage_seen = 1;
-    quiet_windows = 0;
-    if(!own_load_bonus) {
-      LOG_INFO("cg: own load bonus granted (%d queued > %d cells, two slotframes)\n",
-               queued, cells);
-      own_load_bonus = 1;
-      update_uplink();
-      update_root_adjacent();
-    }
-  }
-  last_backlogged = backlogged;
-  ctimer_set(&queue_timer, cg_slotframe_ticks(), queue_tick, NULL);
-}
-/*---------------------------------------------------------------------------*/
-/* Every CG_LOAD_CHECK_PERIOD: release X_S once CG_LOAD_RELEASE_WINDOWS
- * windows in a row have passed with no shortage at all (fall slow). */
-static void
-load_tick(void *ptr)
-{
-  if(shortage_seen) {
-    quiet_windows = 0;
-  } else if(quiet_windows < 255) {
-    quiet_windows++;
-  }
-  shortage_seen = 0;
-  if(own_load_bonus && quiet_windows >= CG_LOAD_RELEASE_WINDOWS) {
-    LOG_INFO("cg: own load bonus released (%u quiet windows)\n", quiet_windows);
-    own_load_bonus = 0;
-    update_uplink();
-    update_root_adjacent();
-  }
-  ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
-}
-#else /* CG_LOAD_QUEUE_BASED */
-/* Every CG_LOAD_CHECK_PERIOD: fold this window's own_load_tx_count into
- * own_load_ewma_q8 (fast-ish attack, slow decay -- see the constant
- * block's own comment), and if that estimate has stayed above
- * CG_LOAD_BUSY_THRESHOLD, set own_load_bonus so cg_own_shard_count()
- * starts including it. Only actually resizes our own uplink/root-adjacent
- * cells when the bonus bit itself changes -- most windows it won't -- and
- * the new count reaches our parent the normal way, through our own next
- * EB, exactly like a real child-count change already does. */
-static void
-load_tick(void *ptr)
-{
-  uint16_t sample_q8;
-  uint8_t new_bonus;
-
-  sample_q8 = (uint16_t)((uint32_t)MIN(own_load_tx_count, CG_LOAD_SATURATE_COUNT) * 256
-                          / CG_LOAD_SATURATE_COUNT);
-  if(sample_q8 >= own_load_ewma_q8) {
-    own_load_ewma_q8 += (int32_t)(sample_q8 - own_load_ewma_q8) >> CG_LOAD_EWMA_ATTACK_SHIFT;
-  } else {
-    own_load_ewma_q8 += (int32_t)(sample_q8 - own_load_ewma_q8) >> CG_LOAD_EWMA_DECAY_SHIFT;
-  }
-  own_load_tx_count = 0;
-
-  new_bonus = own_load_ewma_q8 >= CG_LOAD_BUSY_THRESHOLD ? 1 : 0;
-  if(new_bonus != own_load_bonus) {
-    LOG_INFO("cg: own load bonus %s (ewma=%u/256)\n", new_bonus ? "granted" : "released",
-             own_load_ewma_q8);
-    own_load_bonus = new_bonus;
-    update_uplink();
-    update_root_adjacent();
-  }
-  ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
-}
-#endif /* CG_LOAD_QUEUE_BASED */
-#endif /* CG_LOAD_BONUS */
 /*---------------------------------------------------------------------------*/
 static void
 child_added(const linkaddr_t *addr)
@@ -1314,14 +1184,25 @@ select_packet(uint16_t *slotframe, uint16_t *timeslot, uint16_t *channel_offset)
   if(packetbuf_attr(PACKETBUF_ATTR_FRAME_TYPE) == FRAME802154_DATAFRAME
      && linkaddr_cmp(dst, &orchestra_parent_linkaddr)
      && !linkaddr_cmp(dst, &linkaddr_null)) {
+#if CG_IDLE_RECLAIM
+    if(cg_is_activity()) {
+      own_heard = 1;
+      if(own_idle) {
+        /* Active again: ask for k + 1 cells. Hold-before-use keeps this and
+         * the next frames on the shared cell until an EB has stated the
+         * new count. Re-sized from a timer, not inside this callback. */
+        own_idle = 0;
+        own_idle_q8 = 1 << 8;
+        LOG_INFO("cg: active again, requesting K_S=%u\n", cg_own_shard_count());
+        ctimer_set(&wake_timer, 0, wake_cb, NULL);
+      }
+    }
+#endif
     if(tsch_roots_is_root(&orchestra_parent_linkaddr)) {
       if(list_head(l_root_adjacent) != NULL) {
         *slotframe = sf_root->handle;
         *timeslot = 0xffff;
         *channel_offset = 0xffff;
-#if CG_LOAD_BONUS && !CG_LOAD_QUEUE_BASED
-        own_load_tx_count++;
-#endif
         return 1;
       }
       return 0;
@@ -1330,9 +1211,6 @@ select_packet(uint16_t *slotframe, uint16_t *timeslot, uint16_t *channel_offset)
       *slotframe = sf_short->handle;
       *timeslot = 0xffff;
       *channel_offset = 0xffff;
-#if CG_LOAD_BONUS && !CG_LOAD_QUEUE_BASED
-      own_load_tx_count++;
-#endif
       return 1;
     }
   }
@@ -1361,19 +1239,6 @@ init(uint16_t sf_handle)
   ctimer_set(&bootstrap_timer, CG_BOOTSTRAP_CHECK_PERIOD, bootstrap_tick, NULL);
 #if CG_IDLE_RECLAIM
   ctimer_set(&idle_timer, CG_IDLE_CHECK_PERIOD, idle_tick, NULL);
-#endif
-#if CG_LOAD_BONUS
-  own_load_bonus = 0;
-#if CG_LOAD_QUEUE_BASED
-  last_backlogged = 0;
-  shortage_seen = 0;
-  quiet_windows = 0;
-  ctimer_set(&queue_timer, cg_slotframe_ticks(), queue_tick, NULL);
-#else
-  own_load_tx_count = 0;
-  own_load_ewma_q8 = 0;
-#endif
-  ctimer_set(&load_timer, CG_LOAD_CHECK_PERIOD, load_tick, NULL);
 #endif
 #if CG_HOLD_BEFORE_USE
   announced_shards = 1; /* matches the safe bootstrap default everywhere else */
@@ -1463,7 +1328,16 @@ cg_child_eb_input(const linkaddr_t *source, const linkaddr_t *children_list,
   }
 #endif
   {
-    uint8_t reported = children_shard_count[0] > 0 ? children_shard_count[0] : 1;
+    uint8_t reported = children_shard_count[0];
+#if CG_IDLE_RECLAIM
+    if(reported == 0) {
+      cg_adopt_child_count(c, 0); /* idle announcement: never smoothed */
+      return;
+    }
+#endif
+    if(reported == 0) {
+      reported = 1;
+    }
 #if CG_EWMA_SHARD_COUNT
     int32_t sample_q8 = (int32_t)reported << 8;
     int32_t ewma_q8 = (int32_t)c->shard_ewma_q8;
@@ -1497,6 +1371,31 @@ cg_implicit_ack_active(const linkaddr_t *addr)
 {
   return 0;
 }
+/* TSCH_CALLBACK_UNICAST_DATA_INPUT: every received unicast data frame, raw
+ * frame in packetbuf. A child that becomes active again sends its first
+ * application data on the shared cell (it holds its dedicated cells until an
+ * EB has stated its new count), so the parent sees that data before any
+ * dedicated cell is used. It then treats the child like a newly joined one:
+ * one fresh cell at once, and the child's CURRENT count from its next EB --
+ * not the count it advertised before going idle, which may be out of date
+ * if it gained or lost children meanwhile. */
+void
+cg_data_input(const linkaddr_t *source)
+{
+#if CG_IDLE_RECLAIM
+  struct cg_child *c = find_child(source);
+  if(c == NULL || !c->idle) {
+    return;
+  }
+#if !CG_ABLATION_ANY_FRAME_ACTIVITY
+  if(!cg_frame_is_app_data(packetbuf_dataptr(), packetbuf_datalen())) {
+    return;
+  }
+#endif
+  cg_adopt_child_count(c, 1);
+#endif
+}
+/*---------------------------------------------------------------------------*/
 void
 cg_overhear(const linkaddr_t *source, const linkaddr_t *destination,
             struct tsch_link *link, const uint8_t *payload, uint16_t payload_len)
