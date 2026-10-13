@@ -28,8 +28,7 @@ This is a full Contiki-NG checkout; the APAS-specific additions are:
 ```
 In OS folder  # the APAS mechanism
 examples/6tisch/
-├── child-grandchild-tree/           # base example, all 4 mechanisms configurable via project-conf.h
-├── apas-iotlab-m3/                  # real FIT IoT-LAB deployment, 60 nodes (Grenoble, m3 boards)
+├── child-grandchild-tree-dynamic-kmax/           # base example, all 4 mechanisms configurable via project-conf.h
 ```
 
 
