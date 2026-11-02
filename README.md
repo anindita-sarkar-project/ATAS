@@ -5,9 +5,9 @@
 [![license](https://img.shields.io/badge/license-3--clause%20bsd-brightgreen.svg)](LICENSE.md)
 [![Built on Contiki-NG](https://img.shields.io/badge/built%20on-Contiki--NG-blue)](https://github.com/contiki-ng/contiki-ng)
 
-This repository contains the reference implementation of **APAS**, an autonomous, position-aware slot allocation scheme for 6TiSCH networks, built on top of [Contiki-NG](https://github.com/contiki-ng/contiki-ng). APAS sizes a node's TSCH cells directly from its position in the RPL topology — its own direct child count and RPL rank — rather than from a fixed rule or from traffic observed after the fact.
+This repository contains the reference implementation of **APAS**, an autonomous, topolofy-aware slot scheduling scheme for 6TiSCH networks, built on top of [Contiki-NG](https://github.com/contiki-ng/contiki-ng). APAS sizes a node's TSCH cells directly from its position in the RPL topology — its own direct child count and RPL rank — rather than from a fixed rule or from traffic observed after the fact.
 
-> Anindita Sarkar and Alakesh Kalita, *"Autonomous Position-Aware Slot Allocation for 6TiSCH IoT Networks,"
+> Anindita Sarkar and Alakesh Kalita, *"Autonomous Topology-Aware Slot Scheduling for 6TiSCH IoT Networks,"
 
 ## Why APAS
 
