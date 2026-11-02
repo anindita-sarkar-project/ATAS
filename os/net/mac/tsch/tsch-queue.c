@@ -252,12 +252,19 @@ tsch_queue_add_packet(const linkaddr_t *addr, uint8_t max_transmissions,
           /* Enqueue packet */
           p->qb = queuebuf_new_from_packetbuf();
           if(p->qb != NULL) {
+#if TSCH_WITH_LINK_SELECTOR
+            /* Debug trace, gated on TSCH_WITH_LINK_SELECTOR like every other
+             * PACKETBUF_ATTR_TSCH_SLOTFRAME read in this file -- that
+             * attribute does not exist at all when link selection is off
+             * (see packetbuf.h), so reading it unconditionally here was a
+             * latent build break for any non-Orchestra TSCH build. */
             if(queuebuf_attr(p->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME) >= 0x2000) {
               LOG_INFO("IATRACE enqueued p=%p put_index=%d sf_tag=%u dst=",
                        (void *)p, put_index, queuebuf_attr(p->qb, PACKETBUF_ATTR_TSCH_SLOTFRAME));
               LOG_INFO_LLADDR(addr);
               LOG_INFO_("\n");
             }
+#endif /* TSCH_WITH_LINK_SELECTOR */
             p->sent = sent;
             p->ptr = ptr;
             p->ret = MAC_TX_DEFERRED;
