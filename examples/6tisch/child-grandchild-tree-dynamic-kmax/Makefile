@@ -11,6 +11,25 @@ include $(CONTIKI)/Makefile.identify-target
 
 MODULES += $(CONTIKI_NG_SERVICES_DIR)/orchestra
 
+# Deployment service: maps each node's hardware MAC to a logical id (1=root)
+# for the FIT IoT-LAB m3 build -- see deployment-map.c. Gated to TARGET=iotlab
+# only: BUILD_WITH_DEPLOYMENT=1 (unconditionally set by this module's own
+# module-macros.h the moment it's included in MODULES at all) redirects
+# node_id_init() to deployment_init()/deployment_id_from_lladdr() against
+# deployment-map.c's real-hardware MAC table (see os/sys/node-id.h and
+# os/services/deployment/deployment.c) -- under Cooja, no mote's simulated
+# MAC (derived from simMoteID, arch/platform/cooja/platform.c's set_lladdr())
+# ever matches a real M3 board's MAC, so every single node's node_id silently
+# stayed 0 ("UNMAPPED") the whole run: node 1 never called root_start(), no
+# RPL DAG/TSCH PAN ever formed, and every mote just scanned channels forever
+# (confirmed live: a smoke-test Cooja run showed "Node ID: 0" logged by every
+# mote and zero RPL/application traffic for the full run). Only link this
+# module for the real IoT-LAB build, where the mapping is actually valid.
+ifeq ($(TARGET),iotlab)
+MODULES += $(CONTIKI_NG_SERVICES_DIR)/deployment
+PROJECT_SOURCEFILES += deployment-map.c
+endif
+
 # eb_fixed_shared (not the stock eb_per_time_source): every node's EB Tx/Rx
 # uses one fixed, network-wide-common slot instead of a slot re-derived as
 # hash(current time source address) -- see orchestra-rule-eb-fixed.c's file
@@ -31,22 +50,21 @@ MODULES += $(CONTIKI_NG_SERVICES_DIR)/orchestra
 # the ratio. Reverted to eb_fixed_shared with the library default EB period.
 CFLAGS += -DORCHESTRA_CONF_RULES="{&eb_fixed_shared,&child_grandchild_tree,&default_common}"
 
-# Real hardware (CC26x2 LaunchPads):
-# `make ROOT=1` builds the RPL/TSCH root image;
-# `make CALIBRATE=1` disables the RSSI range threshold and logs RSSI;
-# `make RSSI_MIN=-70` overrides the emulated-range RSSI threshold (dBm).
-ifeq ($(ROOT),1)
-CFLAGS += -DIADS_CONF_IS_ROOT=1
+# Sweep hooks: pass e.g. `make ... APP_RATE=10 SFS_SIZE=43` from the
+# experiment driver (Cooja .csc <commands>, or by hand) to override the
+# per-node traffic rate (Table II traffic-rate sweep) and/or the unicast
+# slotframe length (Table II slotframe-length sweep) without editing
+# project-conf.h/node.c per run. Deliberately single-token VAR=VALUE forms
+# (no spaces/quotes) rather than one combined EXTRA_CFLAGS string, since a
+# Cooja .csc <commands> line is not guaranteed to preserve shell quoting
+# around an embedded multi-flag string.
+ifdef APP_RATE
+CFLAGS += -DAPP_SEND_RATE_CONF=$(APP_RATE)
 endif
-ifeq ($(CALIBRATE),1)
-CFLAGS += -DIADS_CALIBRATE=1
+ifdef SFS_SIZE
+CFLAGS += -DTSCH_CONF_IA_SFS_SIZE=$(SFS_SIZE)
 endif
-ifdef RSSI_MIN
-CFLAGS += -DIADS_RSSI_MIN=$(RSSI_MIN)
-endif
-# `make TXPOWER=-10` overrides the radio TX power (dBm; -20 .. +5).
-ifdef TXPOWER
-CFLAGS += -DIADS_TXPOWER_DBM=$(TXPOWER)
-endif
+# Still accepted for manual command-line use (not used by the .csc files).
+CFLAGS += $(EXTRA_CFLAGS)
 
 include $(CONTIKI)/Makefile.include

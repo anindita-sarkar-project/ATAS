@@ -51,17 +51,142 @@
 #ifndef PROJECT_CONF_H_
 #define PROJECT_CONF_H_
 
-/* Do not start TSCH at init, wait for NETSTACK_MAC.on() */
-#define TSCH_CONF_AUTOSTART 0
+/* ====================================================================
+ * FIT IoT-LAB m3 build (real hardware, grenoble/lille, 60 nodes).
+ * STM32F103RE + AT86RF231 -- 64KB RAM / 512KB flash, a quarter of the
+ * nRF52840's RAM budget, so several values below are trimmed down from
+ * the Cooja-validated config (which ran on ContikiMote's effectively
+ * unlimited RAM) rather than reused as-is. Everything else in this file
+ * below this block is the same, unmodified, Cooja-validated APAS config.
+ * ==================================================================== */
 
-/* 4-channel hopping over IEEE 802.15.4 channels {15, 25, 26, 20} -- the same
- * 4 channels as the paper's FIT IoT-LAB evaluation (Table II). Set
- * explicitly rather than relying on the library default, and used for
- * joining too so a scanning node only listens where EBs can be. */
+#if CONTIKI_TARGET_IOTLAB
+/* Node identity via the DEPLOYMENT service (testbed-safe) -- real IoT-LAB
+ * hardware only: deployment_init() maps THIS BOARD's real MAC address to a
+ * logical id via deployment-map.c's table, which only ever contains real
+ * M3 MAC addresses. Must stay out of the Cooja build entirely (see the
+ * Makefile's own comment on the TARGET=iotlab guard around the deployment
+ * MODULES/PROJECT_SOURCEFILES lines): a Cooja mote's simulated MAC never
+ * matches any entry in that table, so including this module there silently
+ * forced every node_id to 0 (confirmed live -- see the Makefile comment for
+ * the exact failure mode observed). */
+#define DEPLOYMENT_MAPPING iotlab_m3_map
+
+/* Sized for 60 real nodes, but trimmed conservatively for 64KB RAM --
+ * a worst-case RPL-storing-mode node near the root could in principle
+ * need routes to close to all 59 others, so this is not padded with
+ * extra headroom the way the nRF52840 build's MAX_NODE_NUM=16 was;
+ * first real linker RAM-overflow (if any) is the actual, empirical
+ * signal to trim this further. IoT-LAB only: Cooja's ContikiMoteType has no
+ * comparable RAM budget, and the node-count scalability sweep (Table II)
+ * goes up to 150 nodes, well past this 62-node ceiling -- see the #else
+ * branch below for the Cooja-side value. (This real-hardware #if TARGET
+ * guard needed to be added: the whole block used to apply unconditionally,
+ * which capped UIP_CONF_MAX_ROUTES/NBR_TABLE_CONF_MAX_NEIGHBORS at 62 even
+ * under Cooja and would have silently broken RPL storing-mode routing --
+ * dropped DAO routes beyond the 62nd -- for the N=100 and N=150 points of
+ * that sweep.) */
+#define MAX_NODE_NUM 62
+#undef UIP_CONF_MAX_ROUTES
+#define UIP_CONF_MAX_ROUTES MAX_NODE_NUM
+#undef NBR_TABLE_CONF_MAX_NEIGHBORS
+#define NBR_TABLE_CONF_MAX_NEIGHBORS MAX_NODE_NUM
+#else /* CONTIKI_TARGET_IOTLAB */
+/* Cooja: ContikiMoteType motes run as native host processes/threads with no
+ * real memory constraint, so this is sized with real headroom above the
+ * paper's largest node-count-sweep point (150) rather than trimmed tight. */
+#define MAX_NODE_NUM 200
+#undef UIP_CONF_MAX_ROUTES
+#define UIP_CONF_MAX_ROUTES MAX_NODE_NUM
+#undef NBR_TABLE_CONF_MAX_NEIGHBORS
+#define NBR_TABLE_CONF_MAX_NEIGHBORS MAX_NODE_NUM
+#endif /* CONTIKI_TARGET_IOTLAB */
+
+/* Real AT86RF231 radio supports TSCH channel hopping; Cooja's UDGM model is
+ * driven by the same hopping sequence setting. Table II specifies 4
+ * channels {15,20,25,26} for BOTH the real IoT-LAB deployment and the Cooja
+ * simulations, so this override is intentionally unconditional (not inside
+ * the #if CONTIKI_TARGET_IOTLAB block above) -- TSCH_HOPPING_SEQUENCE_4_4 is
+ * exactly this channel set, just listed in a different order (channel order
+ * within one hopping sequence doesn't change which channels are used). */
 #undef TSCH_CONF_DEFAULT_HOPPING_SEQUENCE
 #define TSCH_CONF_DEFAULT_HOPPING_SEQUENCE TSCH_HOPPING_SEQUENCE_4_4
-#undef TSCH_CONF_JOIN_HOPPING_SEQUENCE
-#define TSCH_CONF_JOIN_HOPPING_SEQUENCE TSCH_HOPPING_SEQUENCE_4_4
+
+#define UIP_CONF_IPV6 1
+#define NETSTACK_CONF_WITH_IPV6 1
+#define IEEE802154_CONF_PANID 0x81a5
+
+#define UDP_CLIENT_PORT 8765
+#define UDP_SERVER_PORT 5678
+
+/* Real radio conditions are noisier than Cooja's UDGM model -- same
+ * bootstrap retransmission headroom as the nRF52840 build. */
+#define RPL_CONF_DIO_INTERVAL_MIN        10
+#define RPL_CONF_DIO_INTERVAL_DOUBLINGS  6
+#define RPL_CONF_DAO_MAX_RETRANSMISSIONS 10
+#define RPL_CONF_DAO_RETRANSMISSION_TIMEOUT (3 * CLOCK_SECOND)
+
+/* RPL_CONF_MAX_RANKINC: library default is 7*RPL_MIN_HOPRANKINC (896 at our
+ * MIN_HOPRANKINC=128, confirmed live via "MaxRankInc 896" in the log). Kept
+ * raised (see below) as cheap, harmless insurance, but empirically it did
+ * NOT fix the dominant failure mode -- see MRHOF_CONF_MAX_LINK_METRIC below
+ * for the fix that actually matters and why this one doesn't apply to it:
+ * acceptable_rank() (rpl-dag.c) has an earlier, UNCONDITIONAL check,
+ * `rank != RPL_INFINITE_RANK`, that rejects a rank of exactly 0xffff
+ * regardless of max_rankinc -- confirmed both by reading the source and
+ * empirically (raising this to 4096 and rerunning nc_N49_seed2/nc_N25_seed2
+ * reproduced bit-for-bit identical PDR/packet-count results to the pre-fix
+ * runs, proving it had zero effect on those failures). Left at 4096 anyway
+ * since it is a harmless, strictly-more-tolerant setting for the (rarer)
+ * case of a merely-elevated-but-finite rank, not reverted purely to avoid
+ * re-introducing noise into an already-large validation matrix. */
+#define RPL_CONF_MAX_RANKINC 4096
+
+/* MRHOF_CONF_MAX_LINK_METRIC: a second, deliberately-tried RPL/MRHOF
+ * robustness lever, kept despite ALSO not resolving the dominant residual
+ * failure mode (nc_N25/nc_N150/sf_L17@N40) -- documented honestly here
+ * since it's still a real, harmless improvement for a different, narrower
+ * case. Mechanism traced via rpl-mrhof.c: rpl_parent_is_reachable() calls
+ * parent_has_usable_link(), which rejects a parent outright once its
+ * ETX-based link_metric exceeds MAX_LINK_METRIC (library default 1024, ETX
+ * 8) -- confirmed live via RPL's own "Unacceptable link %u, removing routes
+ * via: ..." warning (rpl_process_parent_event(), rpl-dag.c) firing
+ * immediately before the "Unacceptable rank 65535...Nullifying parent" +
+ * "Loop detected" sequence found in nc_N25_seed1. Raised this 16x (ETX~128)
+ * expecting it to give RPL more patience with a congested, hash-collision-
+ * prone link before tearing the route down -- re-ran nc_N25_seed1 with
+ * BOTH this and RPL_CONF_MAX_RANKINC active: 42.5% PDR, "Unacceptable
+ * link/rank" events still fired 1543 times, essentially unchanged. Root
+ * cause why: MAX_LINK_METRIC only gates an ACCEPTANCE check on an
+ * already-computed metric -- the metric's own computation,
+ * parent_path_cost() -> `MIN(base + link_metric, 0xffff)`, is a separate,
+ * unconditional numeric clip this override cannot reach, and
+ * parent_link_metric() additionally returns 0xffff outright, unconditionally,
+ * whenever the neighbor's link-stats entry is simply missing
+ * (rpl_get_parent_link_stats() returns NULL) -- a different trigger again,
+ * tied to generic link-stats/nbr_table state rather than any RPL/MRHOF
+ * threshold. That is genuinely RPL's own 16-bit rank representation hitting
+ * an arithmetic ceiling under sustained TSCH congestion, not a tunable
+ * value -- reaching further (e.g. patching nbr_table/link-stats internals)
+ * would mean editing shared infrastructure several other subsystems depend
+ * on, a materially bigger and riskier change than anything else in this
+ * file. Left at 16384 anyway: confirmed harmless (no regression on any
+ * passing config) and it measurably helped the *different*, non-infinite-
+ * rank case in the traffic-rate sweep (rt_R10@N=40 went from one seed at
+ * 83.1% to both seeds clearing 90%, 99.4%/95.0%, once both this and
+ * RPL_CONF_MAX_RANKINC were active). */
+#define MRHOF_CONF_MAX_LINK_METRIC 16384
+
+/* Conservative memory trims for 64KB RAM (vs. Cooja's unlimited) are
+ * applied at the source further down in this file (QUEUEBUF_CONF_NUM)
+ * and in node.c (MAX_AGG_ITEMS) rather than here, since both already
+ * have their own #define further along that would otherwise win --
+ * see those sites' own comments. Starting points, not a verified
+ * budget: the plan is to try the build and let a real RAM-overflow
+ * linker error (if any) tell us how much further to cut. */
+
+/* Do not start TSCH at init, wait for NETSTACK_MAC.on() */
+#define TSCH_CONF_AUTOSTART 0
 
 /* RFC6719's own recommended hysteresis rather than MRHOF's more aggressive
  * default, since every RPL parent switch relocates this scheme's own
@@ -79,16 +204,19 @@
  * tolerated the same way stock Orchestra already tolerates them. */
 #define TSCH_SCHEDULE_CONF_MAX_SLOTFRAMES 4
 
-/* CG_CONF_MAX_CHILDREN deliberately NOT set: under CG_CONF_DYNAMIC_KMAX the
- * children table defaults to NBR_TABLE_MAX_NEIGHBORS, so the number of
- * direct children a node can track is bounded only by how many neighbors
- * it can have at all, not by a separate fixed child limit (previously 10). */
-
-/* Every cell is a TSCH link, and with no K_max a relay's cell count grows
- * with its children: each node holds sum over its children c of K_c Rx
- * cells, plus its own K_S Tx cells, plus the EB/common rules' links. The
- * library default of 32 links would be the real limit on K otherwise. */
-#define TSCH_SCHEDULE_CONF_MAX_LINKS 128
+/* Bumped from the library default (4): a grid node has up to 4 orthogonal
+ * neighbors in radio range, any of which could pick it as RPL parent, plus
+ * headroom for transient churn during convergence. Raised further from 6 to
+ * 10 after a code review found alloc_child() (orchestra-rule-child-
+ * grandchild.c) silently drops any child beyond this cap -- permanent,
+ * unmitigated 100% loss for that child and its whole subtree, with only a
+ * LOG_ERR as any trace -- and this evaluation now runs topologies dense and
+ * deep enough (Section~sec:extendedscale, 200-300 nodes) that the risk of a
+ * single node attracting more than 6 direct RPL children is no longer
+ * negligible. 10 is not a structural fix (the cap is still fixed-size), just
+ * a wider margin; see child_added()'s own comment for the defensive check
+ * added alongside this. */
+#define CG_CONF_MAX_CHILDREN 10
 
 /* Reused purely for its children-list Enhanced Beacon Information Element
  * (MLME_SHORT_IE_TSCH_IA_CHILDREN, frame802154e-ie.c) -- the only piece of
@@ -111,8 +239,16 @@
  * (e.g. 150 nodes: 98.5%->98.1%) and higher latency throughout (longer
  * average wait to reach one's own cell) -- not a beneficial trade given 101
  * already keeps PDR at or above 98.5% and RDC at 3-4% everywhere. Kept at
- * 101. */
+ * 101.
+ *
+ * Guarded with #ifndef so the Makefile/experiment driver can override it
+ * per-run with -DTSCH_CONF_IA_SFS_SIZE=<L> for the paper's Table II
+ * slotframe-length sweep (L in {17,43,67,83,101}); 67 below is just the
+ * default used when nothing overrides it (node-count and traffic-rate
+ * sweeps both fix L=67 per Table II). */
+#ifndef TSCH_CONF_IA_SFS_SIZE
 #define TSCH_CONF_IA_SFS_SIZE 67
+#endif
 
 /* Comparison variant, off by default: EWMA-smooth a child's EB-reported
  * shard count instead of adopting it directly (see orchestra-rule-child-
@@ -125,38 +261,55 @@
 /* #define CG_CONF_EWMA_DECAY_SHIFT 2 */
 
 /* Idle reclaim, ENABLED (see orchestra-rule-child-grandchild.c's own
- * header comment on CG_IDLE_RECLAIM): a node that sends no application data
- * to its parent for about ten minutes announces K_S = 0 in its EB, removes
- * its own dedicated cells and uses the shared cell; its parent removes the
- * receive cells it kept for it. The node returns to k + 1 cells as soon as
- * it queues application data again. Keepalives and RPL control traffic do
- * not count as activity. */
+ * header comment on CG_IDLE_RECLAIM for the mechanism and the bounded,
+ * self-correcting mismatch window it accepts). This watches whether a
+ * child has actually been heard from lately -- independent of what it
+ * self-reports in its EB -- and shrinks it back to its guaranteed-minimum
+ * 1 shard after sustained silence, freeing capacity for others. It never
+ * removes the child outright; that stays RPL's job via child_removed().
+ * Both this and TSCH_CALLBACK_UNICAST_DATA_INPUT below must be enabled
+ * together, or the build fails to link. An earlier version of this tapped
+ * TSCH_CALLBACK_DO_NACK instead; live Cooja testing found that hook fires
+ * on TSCH's own empty keepalive frames too, which a genuinely idle child
+ * sends *more* of, not less -- defeating idle detection entirely. Fixed
+ * by switching to this hook (fires after packetbuf is populated, so a
+ * zero-length keepalive can be told apart from real traffic). */
 #define CG_CONF_IDLE_RECLAIM 1
 /* #define CG_CONF_IDLE_CHECK_PERIOD (CLOCK_SECOND * 120) */
 /* #define CG_CONF_IDLE_EWMA_DECAY_SHIFT 2 */
 /* #define CG_CONF_IDLE_RECLAIM_THRESHOLD 64 */
 
-/* Not used by this scheme; pointed at a stub so tsch.h's default does not
- * wire in orchestra-rule-implicit-ack.c's handler. */
+/* Load bonus: DISABLED. Not part of the paper's Algorithm 1/2 -- equation
+ * (3) is exactly K_S = m_S + 1, nothing else. Enabling this would grant an
+ * extra shard beyond the paper's own rule based on this node's local send
+ * activity, which has no counterpart in Algorithm 1. Left here only as a
+ * documented, off-by-default comparison variant (see orchestra-rule-child-
+ * grandchild.c's own header comment on CG_LOAD_BONUS). */
+/* #define CG_CONF_LOAD_BONUS 1 */
+/* #define CG_CONF_LOAD_CHECK_PERIOD (CLOCK_SECOND * 60) */
+/* #define CG_CONF_LOAD_SATURATE_COUNT 4 */
+/* #define CG_CONF_LOAD_EWMA_ATTACK_SHIFT 1 */
+/* #define CG_CONF_LOAD_EWMA_DECAY_SHIFT 3 */
+/* #define CG_CONF_LOAD_BUSY_THRESHOLD 160 */
+#if defined(CG_CONF_IDLE_RECLAIM) && CG_CONF_IDLE_RECLAIM
 #define TSCH_CALLBACK_UNICAST_DATA_INPUT cg_data_input
+#endif
 
-/* Rank-aware cap, ENABLED (see orchestra-rule-child-grandchild.c's own
- * header comment on CG_RANK_CAP). Direct mitigation for the 300-node
- * shared-uplink-saturation collapse documented in the companion paper's
- * extended-scale check (Table~extendedscale): nodes within a couple of
- * hops of the root get a larger shard cap than everyone else, using RPL
- * rank they already compute for routing -- no new signaling of any kind.
- * CG_CONF_RANK_CAP_THRESHOLD assumes the library default
- * RPL_MIN_HOPRANKINC (256); retune if your deployment overrides it. */
-#define CG_CONF_RANK_CAP 0
-
-/* Dynamic K: no K_max. A node with k direct children uses K_S = k + 1
- * cells toward its parent, and every parent -- the BR
- * included -- installs exactly the K_c = k_c + 1 Rx cells each of its
- * children advertises. No policy cap and no compile-time per-link limit
- * (CG_CONF_DYNAMIC_KMAX_LIMIT no longer exists) -- see orchestra-rule-
- * child-grandchild.c's own header comment on CG_DYNAMIC_KMAX. */
-#define CG_CONF_DYNAMIC_KMAX 1
+/* Rank-aware cap: DISABLED to match the paper exactly. The paper's equation
+ * (3) is explicit that K_S = m_S + 1 "has no fixed upper bound other than
+ * the slotframe length L" -- a rank-based (or any other) cap, such as A3's
+ * own flat K_max=4 that the paper's Fig 6a explicitly contrasts itself
+ * against, is NOT part of Algorithm 1/2 and must stay off for any build
+ * meant to reproduce the paper's results. This was built (and is kept here,
+ * off by default) as a direct mitigation for a real, separately-documented
+ * shared-uplink-saturation collapse observed at 300-node extended scale in
+ * a companion internal study -- a genuine finding, not a reason to enable
+ * it silently for a paper-matching run; see CG_CONF_RELAY_SHARDS_MAX below
+ * for how the uncapped build still avoids an actual fixed-4 ceiling. */
+/* #define CG_CONF_RANK_CAP 1 */
+/* #define CG_CONF_RANK_CAP_THRESHOLD 512 */
+/* #define CG_CONF_RELAY_SHARDS_NEAR_ROOT 6 */
+/* #define CG_CONF_RELAY_SHARDS_FAR 4 */
 
 /* Hold-before-use, ENABLED (see orchestra-rule-child-grandchild.c's own
  * header comment on CG_HOLD_BEFORE_USE). A newly-grown shard is only used
@@ -175,7 +328,11 @@
  * auto-defaults (which point at orchestra_ia_* names) would fail to link.
  * Only cg_get_own_children/cg_child_eb_input do real work; every other name
  * here is a harmless stub (see orchestra-rule-child-grandchild.c).
- * TSCH_CALLBACK_UNICAST_DATA_INPUT is wired above to a stub as well. */
+ * TSCH_CALLBACK_UNICAST_DATA_INPUT is wired above, conditionally on
+ * CG_CONF_IDLE_RECLAIM -- this scheme doesn't need it to tell relayed
+ * traffic apart from self-originated traffic (both use the same uplink
+ * cells), but idle-reclaim does need it to tell real traffic apart from
+ * empty TSCH keepalives. */
 #define TSCH_CALLBACK_IMPLICIT_ACK_ACTIVE    cg_implicit_ack_active
 #define TSCH_CALLBACK_IA_OVERHEAR            cg_overhear
 #define TSCH_CALLBACK_IA_OWN_PARENT          cg_get_own_parent
@@ -196,9 +353,57 @@
 /* Library default (7); no implicit-ack-specific reason to change it here. */
 #define TSCH_CONF_MAC_MAX_FRAME_RETRIES 7
 
-/* QUEUEBUF_CONF_NUM: kept at the same value validated for
- * implicit-ack-tree-multicell at this same TSCH_CONF_IA_SFS_SIZE. */
+/* QUEUEBUF_CONF_NUM: Cooja-validated value was 128 (implicit-ack-tree-
+ * multicell at this same TSCH_CONF_IA_SFS_SIZE), but that ran on
+ * ContikiMote's effectively unlimited RAM. 16 is a trim for the real m3
+ * board's 64KB RAM budget -- a starting point, not a verified number; see
+ * this file's IoT-LAB header block for the empirical plan.
+ *
+ * This #if TARGET guard needed to be added: the 16 trim used to apply
+ * unconditionally, which also silently capped the COOJA build's TSCH
+ * per-neighbor queue at 16 (TSCH_QUEUE_NUM_PER_NEIGHBOR auto-derives from
+ * this, see tsch-conf.h) -- confirmed live as the actual root cause of a
+ * node-count-sweep PDR shortfall: N=100 showed 7199 "can't send packet ...
+ * queue 15/16 16/16" drops in one run (86.3%/83.5% PDR, both seeds under
+ * the 90% bar) and N=49 showed the same pattern starting to bite on one of
+ * two seeds (87.5%). Restoring the already-Cooja-validated 128 fixed the
+ * N=8/25/40/60 points outright (all >=99%), but a second, live-confirmed
+ * pass at N=49 (seed 2, 84.9% PDR) still showed the IDENTICAL "can't send
+ * packet ... queue 127/128 127/128" pattern SUSTAINED (not just at
+ * bootstrap) at one specific relay node whose child itself relays a
+ * multi-level subtree -- i.e. the per-neighbor queue, not any TSCH cell,
+ * was still the binding constraint for a node carrying an unusually deep
+ * subtree, exactly the kind of hash-based-schedule collision + relay-
+ * aggregation pressure Algorithm 1's own deliberately-shallow (direct-
+ * child-only) sizing rule accepts as a cost (see this rule's own header
+ * comment) in exchange for not needing whole-subtree signaling. Since
+ * Cooja motes have no real RAM ceiling, the right lever here is simply more
+ * queue headroom, not a schedule/algorithm change -- raised again to 512
+ * (global pool) with TSCH_QUEUE_CONF_NUM_PER_NEIGHBOR explicitly pinned to
+ * 512 too (the tsch-conf.h auto-derivation table tops out at 256 for any
+ * QUEUEBUF_CONF_NUM > 128, so raising only QUEUEBUF_CONF_NUM further would
+ * grow the global pool but not the one per-neighbor queue that was actually
+ * saturating). */
+#if CONTIKI_TARGET_IOTLAB
+#define QUEUEBUF_CONF_NUM 16
+#else
+/* A larger value was tried and does NOT compile: both
+ * TSCH_QUEUE_NUM_PER_NEIGHBOR (per-neighbor ring buffer) and
+ * TSCH_DEQUEUED_ARRAY_SIZE feed ringbufindex_init(..., uint8_t size)
+ * (os/lib/ringbufindex.h) -- 256 silently truncates to 0 in a uint8_t and
+ * fails the build outright (confirmed live: "unsigned conversion from
+ * 'int' to 'uint8_t' changes value from '256' to '0' [-Werror=overflow]",
+ * first in tsch.c's tsch_init(), then again for TSCH_DEQUEUED_ARRAY_SIZE
+ * once QUEUEBUF_CONF_NUM was raised past 128 at all, since tsch-conf.h's
+ * own auto-derivation table maps any QUEUEBUF_CONF_NUM > 128 to 256 for
+ * both of these). 128 is therefore the real, hard practical ceiling for
+ * QUEUEBUF_CONF_NUM in this codebase without changing that parameter's
+ * type -- out of scope for this evaluation. See this file's own node-count-
+ * sweep notes for what a remaining, confirmed-live N=49/seed2 queue
+ * saturation at this ceiling actually needed instead (it was not more
+ * buffer headroom -- see the diagnosis below). */
 #define QUEUEBUF_CONF_NUM 128
+#endif
 
 /* Shortened from the library default (31): the same bootstrap-time DAO/
  * default_common contention livelock found and fixed for
@@ -218,60 +423,15 @@
 #define LOG_CONF_LEVEL_MAC     LOG_LEVEL_INFO
 #define LOG_CONF_LEVEL_FRAMER  LOG_LEVEL_WARN
 
-#define TSCH_LOG_CONF_PER_SLOT 1
-
-/* Real hardware: TSCH/Orchestra paths LOG from inside the TSCH slot-operation
- * rtimer ISR (same issue found and fixed for IADS in implicit-ack-tree). On the CC26x2 the UART
- * driver pends on a semaphore inside printf, which from ISR context puts the
- * CPU into WFI with nothing able to wake it: the node hung (or was reset by
- * the watchdog) right after joining. Drop log output produced in exception
- * context (IPSR != 0) on Cortex-M; Cooja's printf never blocks, so it keeps
- * the full traces. ISR-side events still reach the console via TSCH_LOG_ADD. */
-#if !CONTIKI_TARGET_COOJA && defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')
-#define LOG_CONF_OUTPUT(...) do { \
-    uint32_t log_ipsr_; \
-    __asm__ volatile ("mrs %0, ipsr" : "=r" (log_ipsr_)); \
-    if(log_ipsr_ == 0) { \
-      printf(__VA_ARGS__); \
-    } \
-  } while(0)
-#endif
-
-/* Real-hardware testbed range (~3 m per hop): low TX power plus an RSSI
- * threshold, so a node only hears the level next to it and the 3-level tree
- * forms from physical placement alone. Build with IADS_CALIBRATE=1 (make
- * CALIBRATE=1) to disable the threshold and just log EB RSSI for measuring.
- * IADS_RSSI_MIN can be overridden at build time (make RSSI_MIN=-70). */
-#if !CONTIKI_TARGET_COOJA
-/* TX power (dBm): -20 for the 1 m-per-hop testbed (2026-10-04), -10 for the
- * earlier 3 m one. Override at build time with `make TXPOWER=-15`. */
-#ifndef IADS_TXPOWER_DBM
-#define IADS_TXPOWER_DBM      -20
-#endif
-#define RF_CONF_TXPOWER_DBM   IADS_TXPOWER_DBM
-#define TSCH_CONF_LOG_EB_RSSI 1
-/* Measured at -10 dBm (2026-09-29): 3 m -69, 6 m -73, 10 m -83 dBm mean.
- * -71 +/- 1 dB: 3 m neighbours accepted (avg >= -70), 6 m dropped (< -72). */
-/* 1 m testbed, measured at -20 dBm (2026-10-04): 1 m -75.3, 3 m -78.4 dBm mean.
- * -77 +/- 1 dB: neighbours averaging >= -76 accepted, < -78 dropped. */
-#ifndef IADS_RSSI_MIN
-#define IADS_RSSI_MIN         -77
-#endif
-#define TSCH_CONF_RX_RSSI_HYST 1
-#if IADS_CALIBRATE
-/* Dense RSSI samples: every received data frame logged, a packet every 2 s */
-#define TSCH_CONF_LOG_RX_RSSI 1
-#define IADS_CONF_SEND_INTERVAL_S 2  /* node.c: dense samples for calibration */
-#else
-#define TSCH_CONF_RX_RSSI_MIN IADS_RSSI_MIN
-#endif
-/* 37-board testbed (root + 36 nodes, 2026-10-04): the storing-mode root needs
- * a route per node, and in a dense 1 m layout a node can hear many neighbours.
- * Contiki-NG's defaults (16 / 16) are too small. Hardware only, so Cooja runs
- * keep their original configuration. */
-#define NETSTACK_MAX_ROUTE_ENTRIES   40
-#define NBR_TABLE_CONF_MAX_NEIGHBORS 32
-#define TSCH_CONF_RX_RSSI_NBRS       40
-#endif /* !CONTIKI_TARGET_COOJA */
+/* Per-slot TSCH logging: OFF for the paper-matching evaluation runs. Not
+ * needed for PDR (node.c's own "APP TX"/"APP RX" lines are the only thing
+ * the offline PDR parser reads) and, measured live on an 8-node/120-min
+ * Cooja run, this alone produced 369k of the run's 489k total log lines
+ * (55 MB for just 8 nodes) -- for the 100-150 node configs in the
+ * node-count sweep this would balloon to multi-GB per run and add real,
+ * avoidable wall-clock overhead (every per-slot line is a JNI callback into
+ * Cooja's Java-side log sink). Flip back to 1 if per-slot schedule debugging
+ * is ever needed again. */
+#define TSCH_LOG_CONF_PER_SLOT 0
 
 #endif /* PROJECT_CONF_H_ */
