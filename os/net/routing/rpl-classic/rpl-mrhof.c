@@ -80,8 +80,24 @@
 
 #if !RPL_MRHOF_SQUARED_ETX
 /* Configuration parameters of RFC6719. Reject parents that have a higher
-   link metric than the following. The default value is 512 but we use 1024. */
+   link metric than the following. The default value is 512 but we use 1024.
+   Overridable via MRHOF_CONF_MAX_LINK_METRIC -- added because a congested,
+   hash-collision-prone TSCH link's ETX can climb past this (confirmed live:
+   RPL's own "Unacceptable link %u, removing routes via: ..." warning,
+   rpl-dag.c's rpl_process_parent_event(), firing on exactly this check) and
+   trigger route removal + cascading parent nullification/rank-poisoning
+   through that node's whole subtree, which disrupts far more traffic than
+   the original transient congestion did on its own. The dedicated TSCH
+   cells for that link keep working (just slower) through MAC-level
+   retries; giving RPL more patience before declaring the route unusable
+   avoids the self-inflicted disruption of tearing it down and rebuilding
+   it. This is an RPL/MRHOF robustness parameter, not a change to the
+   paper's own cell-allocation algorithm. */
+#ifdef MRHOF_CONF_MAX_LINK_METRIC
+#define MAX_LINK_METRIC     MRHOF_CONF_MAX_LINK_METRIC
+#else
 #define MAX_LINK_METRIC     1024 /* Eq ETX of 8 */
+#endif
 
 /*
  * Hysteresis of MRHOF: the rank must differ more than
